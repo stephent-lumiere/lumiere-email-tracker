@@ -47,6 +47,46 @@ EXCLUDE = [
     'newsletter', 'stripe.com', 'calsavers.com'
 ]
 
+# Default internal domains (fallback if DB fetch fails)
+DEFAULT_INTERNAL_DOMAINS = [
+    'lumiere.education',
+    'ladderinternships.com',
+    'veritasai.com',
+    'horizoninspires.com',
+    'youngfounderslab.org',
+    'wallstreetguide.net',
+]
+
+# Will be populated from tracked_users table
+_internal_domains = None
+
+
+def get_internal_domains() -> list:
+    """Fetch internal domains from tracked_users table, with caching."""
+    global _internal_domains
+    if _internal_domains is not None:
+        return _internal_domains
+
+    try:
+        supabase = get_supabase()
+        result = supabase.table("tracked_users").select("domain").execute()
+        if result.data:
+            # Get unique domains from tracked users
+            domains = set(row["domain"] for row in result.data if row.get("domain"))
+            # Combine with defaults to ensure we don't miss any
+            _internal_domains = list(domains.union(set(DEFAULT_INTERNAL_DOMAINS)))
+        else:
+            _internal_domains = DEFAULT_INTERNAL_DOMAINS
+    except Exception:
+        _internal_domains = DEFAULT_INTERNAL_DOMAINS
+
+    return _internal_domains
+
+
+def is_internal_email(email: str) -> bool:
+    """Check if an email is from an internal domain."""
+    return any(domain in email for domain in get_internal_domains())
+
 # Thread-local storage for Gmail service
 _thread_local = threading.local()
 
@@ -135,7 +175,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
 
         if is_from_user:
             result["sent"].append(date_str)
-        elif not is_noise and "lumiere.education" not in m["email"]:
+        elif not is_noise and not is_internal_email(m["email"]):
             result["received"].append(date_str)
 
     # Find ALL external→user pairs (need at least 2 messages)
@@ -143,7 +183,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
         return result
 
     for i, m in enumerate(parsed):
-        is_external = "lumiere.education" not in m["email"]
+        is_external = not is_internal_email(m["email"])
         is_noise = any(ex in m["email"] for ex in EXCLUDE)
 
         if is_external and not is_noise:
@@ -181,7 +221,10 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     print(f"  Fetching thread IDs...")
     all_threads = []
     page_token = None
-    query = "from:(-lumiere.education) -from:mailer-daemon -from:postmaster -from:noreply -from:notifications"
+    # Build query to exclude internal domains and noise
+    internal_domains = get_internal_domains()
+    internal_excludes = " ".join([f"-from:{domain}" for domain in internal_domains])
+    query = f"{internal_excludes} -from:mailer-daemon -from:postmaster -from:noreply -from:notifications"
 
     while len(all_threads) < max_threads:
         try:
