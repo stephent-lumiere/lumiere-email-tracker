@@ -1,0 +1,29 @@
+# Credentials - NEVER commit these
+credentials.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Debug/test files
+debug_*.py
+example_*.py
+inspect_*.py
+spot_check.py
+export_*.py
+*.csv
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
