@@ -112,11 +112,49 @@ Each domain needs to authorize the service account in their Google Admin Console
 
 ## How to Update Using Claude Code
 
+### Installing Claude Code on Mac (Step-by-Step)
+
+**Step 1: Open Terminal**
+- Press `Cmd + Space` to open Spotlight
+- Type `Terminal` and press Enter
+
+**Step 2: Install Homebrew (if you don't have it)**
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+Follow the prompts. When done, close and reopen Terminal.
+
+**Step 3: Install Node.js**
+```bash
+brew install node
+```
+Verify it worked: `node --version` (should show v18 or higher)
+
+**Step 4: Install Claude Code**
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+**Step 5: Authenticate**
+```bash
+claude
+```
+The first time you run it, it will open a browser window to log in with your Anthropic account (Claude Pro or Max subscription), or ask for an API key.
+
+**Step 6: Navigate to the project and start coding**
+```bash
+cd ~/lumiere-email-tracker
+claude
+```
+Now just type what you want to change in plain English!
+
+---
+
 ### Adding a New Feature to the Dashboard
 
 ```
 Open Claude Code in the project directory:
-cd /Users/stephen/lumiere-email-tracker
+cd ~/lumiere-email-tracker
 
 Then describe what you want:
 "Add a chart showing response time trends over the past 30 days"
