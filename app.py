@@ -111,6 +111,36 @@ def get_stats_from_supabase(start_date: date, end_date: date) -> pd.DataFrame:
         "median_response_hours": "mean",
     }).reset_index()
 
+    # Fetch user info (domain, display_name, team_function) from tracked_users
+    users_result = supabase.table("tracked_users").select("email, domain, display_name, team_function").execute()
+    if users_result.data:
+        users_df = pd.DataFrame(users_result.data)
+        aggregated = aggregated.merge(
+            users_df,
+            left_on="user_email",
+            right_on="email",
+            how="left"
+        )
+        # Extract domain from email if not in tracked_users
+        aggregated["domain"] = aggregated.apply(
+            lambda row: row["domain"] if pd.notna(row.get("domain")) else row["user_email"].split("@")[1] if "@" in row["user_email"] else "unknown",
+            axis=1
+        )
+        aggregated["display_name"] = aggregated.apply(
+            lambda row: row["display_name"] if pd.notna(row.get("display_name")) else row["user_email"].split("@")[0],
+            axis=1
+        )
+        # Handle team_function
+        aggregated["team_function"] = aggregated.apply(
+            lambda row: row["team_function"] if pd.notna(row.get("team_function")) else "unknown",
+            axis=1
+        )
+    else:
+        # Fallback: extract domain from email
+        aggregated["domain"] = aggregated["user_email"].apply(lambda x: x.split("@")[1] if "@" in x else "unknown")
+        aggregated["display_name"] = aggregated["user_email"].apply(lambda x: x.split("@")[0])
+        aggregated["team_function"] = "unknown"
+
     # Rename columns to match dashboard format
     aggregated = aggregated.rename(columns={
         "user_email": "Email",
@@ -119,14 +149,19 @@ def get_stats_from_supabase(start_date: date, end_date: date) -> pd.DataFrame:
         "emails_received": "Emails Received",
         "emails_sent": "Emails Sent",
         "response_pairs_count": "Responses Tracked",
+        "domain": "Domain",
+        "display_name": "Name",
+        "team_function": "Team",
     })
 
     # Round numeric columns
     aggregated["Avg Response (hrs)"] = aggregated["Avg Response (hrs)"].round(1)
     aggregated["Median Response (hrs)"] = aggregated["Median Response (hrs)"].round(1)
 
-    # Reorder columns: Median first, then Avg, then Responses Tracked
-    column_order = ["Email", "Median Response (hrs)", "Avg Response (hrs)", "Responses Tracked", "Emails Received", "Emails Sent"]
+    # Reorder columns
+    column_order = ["Name", "Email", "Domain", "Team", "Median Response (hrs)", "Avg Response (hrs)", "Responses Tracked", "Emails Received", "Emails Sent"]
+    # Only include columns that exist
+    column_order = [c for c in column_order if c in aggregated.columns]
     aggregated = aggregated[column_order]
 
     return aggregated
@@ -296,6 +331,12 @@ with tab_manage:
         st.subheader("Add New User")
         new_email = st.text_input("Email Address", placeholder="user@lumiere.education")
         new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
+        team_function = st.selectbox(
+            "Team Function",
+            options=["operations", "growth"],
+            index=0,
+            help="Select the team this user belongs to"
+        )
         fetch_history = st.checkbox("Fetch 90 days of email history", value=True)
 
         if st.button("Add User & Fetch Data", use_container_width=True, type="primary"):
@@ -341,6 +382,7 @@ with tab_manage:
                             "email": new_email,
                             "display_name": new_name if new_name else None,
                             "domain": domain,
+                            "team_function": team_function,
                             "is_active": True
                         }).execute()
                         st.success(f"✅ Added {new_email} to tracked users!")
@@ -446,71 +488,102 @@ with tab_dashboard:
         st.warning("No data found for the selected date range.")
         st.stop()
 
-    # Check for query param navigation (from button clicks)
-    query_user = st.query_params.get("user", None)
-    if query_user and query_user in df['Email'].tolist():
-        selected_email = query_user
-    else:
-        selected_email = 'All'
+    # Filters section
+    st.markdown("### 🔍 Filters")
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
 
-    # Build options list
-    options_list = ['📊 All Team Members'] + df['Email'].tolist()
+    with filter_col1:
+        # Domain filter
+        all_domains = ["All Domains"] + sorted(df['Domain'].unique().tolist())
+        selected_domain = st.selectbox("Domain", options=all_domains, key="domain_filter")
 
-    # Determine current index based on selection
-    if selected_email == 'All':
-        current_index = 0
-    elif selected_email in df['Email'].tolist():
-        current_index = df['Email'].tolist().index(selected_email) + 1
-    else:
-        current_index = 0
+    with filter_col2:
+        # Team filter
+        all_teams = ["All Teams"] + sorted([t for t in df['Team'].unique().tolist() if t != "unknown"])
+        selected_team = st.selectbox("Team", options=all_teams, key="team_filter")
 
-    # Prominent selector at top
-    st.markdown("### 👤 View Dashboard For:")
-    col_select, col_spacer = st.columns([2, 3])
-    with col_select:
-        dropdown_selection = st.selectbox(
-            "Select Individual",
-            options=options_list,
-            index=current_index,
-            key='email_selector',
-            label_visibility="collapsed"
-        )
+    with filter_col3:
+        # Individual filter
+        filtered_for_individual = df.copy()
+        if selected_domain != "All Domains":
+            filtered_for_individual = filtered_for_individual[filtered_for_individual['Domain'] == selected_domain]
+        if selected_team != "All Teams":
+            filtered_for_individual = filtered_for_individual[filtered_for_individual['Team'] == selected_team]
 
-    # Handle dropdown change
-    if dropdown_selection == '📊 All Team Members':
-        if selected_email != 'All':
-            st.query_params.clear()
-            st.rerun()
-        selected_email = 'All'
-    elif dropdown_selection != selected_email:
-        st.query_params["user"] = dropdown_selection
-        st.rerun()
+        individual_options = ["All Individuals"] + filtered_for_individual['Email'].tolist()
+        selected_individual = st.selectbox("Individual", options=individual_options, key="individual_filter")
+
+    # Apply filters
+    df_filtered = df.copy()
+    if selected_domain != "All Domains":
+        df_filtered = df_filtered[df_filtered['Domain'] == selected_domain]
+    if selected_team != "All Teams":
+        df_filtered = df_filtered[df_filtered['Team'] == selected_team]
+    if selected_individual != "All Individuals":
+        df_filtered = df_filtered[df_filtered['Email'] == selected_individual]
 
     st.divider()
 
-    if selected_email == 'All':
-        # Team summary metrics
-        st.subheader(f"Team Summary ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')})")
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            st.metric("Team Median Response", f"{df['Median Response (hrs)'].mean():.1f} hrs")
-        with col2:
-            st.metric("Team Avg Response", f"{df['Avg Response (hrs)'].mean():.1f} hrs")
-        with col3:
-            st.metric("Responses Tracked", f"{int(df['Responses Tracked'].sum())}")
-        with col4:
-            st.metric("Emails Received", f"{int(df['Emails Received'].sum())}")
-        with col5:
-            st.metric("Emails Sent", f"{int(df['Emails Sent'].sum())}")
+    # Summary metrics for filtered data
+    filter_desc = []
+    if selected_domain != "All Domains":
+        filter_desc.append(f"@{selected_domain}")
+    if selected_team != "All Teams":
+        filter_desc.append(f"{selected_team.capitalize()}")
+    if selected_individual != "All Individuals":
+        filter_desc.append(selected_individual)
 
+    filter_label = " | ".join(filter_desc) if filter_desc else "All Team Members"
+
+    st.subheader(f"Summary: {filter_label}")
+    st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')} ({len(df_filtered)} people)")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Median Response", f"{df_filtered['Median Response (hrs)'].mean():.1f} hrs")
+    with col2:
+        st.metric("Avg Response", f"{df_filtered['Avg Response (hrs)'].mean():.1f} hrs")
+    with col3:
+        st.metric("Responses Tracked", f"{int(df_filtered['Responses Tracked'].sum())}")
+    with col4:
+        st.metric("Emails Received", f"{int(df_filtered['Emails Received'].sum())}")
+    with col5:
+        st.metric("Emails Sent", f"{int(df_filtered['Emails Sent'].sum())}")
+
+    st.divider()
+
+    # Performance table (sortable)
+    st.subheader("Performance Table")
+
+    # Prepare display dataframe
+    df_display = df_filtered[['Name', 'Email', 'Domain', 'Team', 'Median Response (hrs)', 'Avg Response (hrs)', 'Responses Tracked', 'Emails Received', 'Emails Sent']].copy()
+    df_display = df_display.sort_values('Median Response (hrs)')
+
+    # Use st.dataframe with sorting enabled
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Name": st.column_config.TextColumn("Name", width="medium"),
+            "Email": st.column_config.TextColumn("Email", width="large"),
+            "Domain": st.column_config.TextColumn("Domain", width="medium"),
+            "Team": st.column_config.TextColumn("Team", width="small"),
+            "Median Response (hrs)": st.column_config.NumberColumn("Median (hrs)", format="%.1f"),
+            "Avg Response (hrs)": st.column_config.NumberColumn("Avg (hrs)", format="%.1f"),
+            "Responses Tracked": st.column_config.NumberColumn("Responses", format="%d"),
+            "Emails Received": st.column_config.NumberColumn("Received", format="%d"),
+            "Emails Sent": st.column_config.NumberColumn("Sent", format="%d"),
+        }
+    )
+
+    # Chart - only show if more than 1 person
+    if len(df_filtered) > 1:
         st.divider()
+        st.subheader("Response Time Ranking")
 
-        # Show ranking table - sorted by response time (fastest first)
-        st.subheader("Individual Performance Ranking")
+        df_sorted = df_filtered.sort_values('Median Response (hrs)')
 
-        df_sorted = df.sort_values('Median Response (hrs)')
-
-        # Response time ranking chart - showing both avg and median
         fig_ranking = go.Figure()
 
         colors = ['#00CC96' if x < 4 else '#636EFA' if x < 12 else '#EF553B'
@@ -518,7 +591,7 @@ with tab_dashboard:
 
         fig_ranking.add_trace(go.Bar(
             x=df_sorted['Median Response (hrs)'],
-            y=df_sorted['Email'],
+            y=df_sorted['Name'],
             orientation='h',
             marker_color=colors,
             text=[f"Median: {m:.1f}h | Avg: {a:.1f}h" for m, a in zip(df_sorted['Median Response (hrs)'], df_sorted['Avg Response (hrs)'])],
@@ -528,131 +601,11 @@ with tab_dashboard:
         fig_ranking.update_layout(
             xaxis_title='Median Response Time (hours)',
             yaxis_title='',
-            height=50 + len(df) * 60,
+            height=50 + len(df_filtered) * 40,
             showlegend=False
         )
 
         st.plotly_chart(fig_ranking, use_container_width=True)
-
-        # Full table with clickable names
-        st.subheader("All Individuals")
-
-        # Create clickable table using columns
-        header_cols = st.columns([3, 1.5, 1.5, 1.5, 1.5, 1.5])
-        header_cols[0].markdown("**Email**")
-        header_cols[1].markdown("**Median (hrs)**")
-        header_cols[2].markdown("**Avg (hrs)**")
-        header_cols[3].markdown("**Responses**")
-        header_cols[4].markdown("**Received**")
-        header_cols[5].markdown("**Sent**")
-
-        st.divider()
-
-        for idx, row in df_sorted.iterrows():
-            cols = st.columns([3, 1.5, 1.5, 1.5, 1.5, 1.5])
-            email = row['Email']
-            if cols[0].button(f"→ {email}", key=f"btn_{email}", use_container_width=True, type="primary"):
-                st.query_params["user"] = email
-                st.rerun()
-            cols[1].write(f"{row['Median Response (hrs)']:.1f}")
-            cols[2].write(f"{row['Avg Response (hrs)']:.1f}")
-            cols[3].write(f"{int(row['Responses Tracked'])}")
-            cols[4].write(f"{int(row['Emails Received'])}")
-            cols[5].write(f"{int(row['Emails Sent'])}")
-
-    else:
-        # Individual detail view
-        person = df[df['Email'] == selected_email].iloc[0]
-
-        st.subheader(f"{selected_email}")
-
-        # Get min/max response times for this user
-        trend_df = get_daily_trend(selected_email, start_date, end_date)
-        if not trend_df.empty:
-            min_response = trend_df['min_response_hours'].min()
-            max_response = trend_df['max_response_hours'].max()
-        else:
-            min_response = None
-            max_response = None
-
-        # Key metrics for this person
-        col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("Median Response", f"{person['Median Response (hrs)']:.1f} hrs")
-        with col2:
-            st.metric("Avg Response", f"{person['Avg Response (hrs)']:.1f} hrs")
-        with col3:
-            if min_response is not None:
-                st.metric("Fastest Response", f"{min_response:.1f} hrs")
-            else:
-                st.metric("Fastest Response", "N/A")
-        with col4:
-            if max_response is not None:
-                st.metric("Slowest Response", f"{max_response:.1f} hrs")
-            else:
-                st.metric("Slowest Response", "N/A")
-
-        col5, col6, col7 = st.columns(3)
-        with col5:
-            st.metric("Responses Tracked", f"{int(person['Responses Tracked'])}")
-        with col6:
-            st.metric("Emails Received", f"{int(person['Emails Received'])}")
-        with col7:
-            st.metric("Emails Sent", f"{int(person['Emails Sent'])}")
-
-        st.divider()
-
-        # Recent response pairs
-        col_header, col_limit = st.columns([3, 1])
-        with col_header:
-            st.subheader(f"Recent Tracked Response Pairs")
-            st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}")
-        with col_limit:
-            num_pairs = st.selectbox(
-                "Show",
-                options=[10, 25, 50, 100],
-                index=0,
-                key="num_pairs_selector"
-            )
-
-        recent_pairs = get_recent_response_pairs(selected_email, start_date, end_date, limit=num_pairs)
-
-        if not recent_pairs.empty:
-            st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_time']].copy()
-            display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response Time']
-            st.dataframe(display_pairs, use_container_width=True, hide_index=True)
-        else:
-            st.info("No response pairs found for this user in this time period.")
-
-        st.divider()
-
-        # Compare to team
-        st.subheader("Comparison to Team")
-
-        fig_compare = go.Figure()
-
-        # Highlight selected person
-        colors = ['#636EFA' if email != selected_email else '#EF553B'
-                  for email in df['Email']]
-
-        fig_compare.add_trace(go.Bar(
-            x=df['Email'],
-            y=df['Median Response (hrs)'],
-            marker_color=colors,
-            text=[f"{x:.1f}" for x in df['Median Response (hrs)']],
-            textposition='outside'
-        ))
-
-        fig_compare.update_layout(
-            xaxis_title='',
-            yaxis_title='Median Response Time (hrs)',
-            height=400,
-            showlegend=False
-        )
-
-        st.plotly_chart(fig_compare, use_container_width=True)
 
     # Understanding metrics at the bottom
     st.divider()
