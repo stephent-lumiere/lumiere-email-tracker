@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from supabase import create_client
@@ -17,6 +18,37 @@ def get_supabase():
         os.getenv("SUPABASE_URL"),
         os.getenv("SUPABASE_KEY")
     )
+
+
+def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool:
+    """Trigger the GitHub Actions workflow to fetch email data."""
+    github_token = os.getenv("GITHUB_TOKEN")
+    if not github_token:
+        return False, "GitHub token not configured"
+
+    url = "https://api.github.com/repos/stephent-lumiere/lumiere-email-tracker/actions/workflows/daily-sync.yml/dispatches"
+
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+
+    data = {
+        "ref": "main",
+        "inputs": {
+            "user_email": user_email,
+            "backfill": "true" if backfill else "false"
+        }
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 204:
+            return True, "Workflow triggered successfully"
+        else:
+            return False, f"Error: {response.status_code} - {response.text}"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
 
 def get_stats_from_supabase(start_date: date, end_date: date) -> pd.DataFrame:
     """
@@ -222,8 +254,9 @@ with st.sidebar:
     with st.expander("Add New User to Track"):
         new_email = st.text_input("Email Address", placeholder="user@lumiere.education")
         new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
+        fetch_history = st.checkbox("Fetch 90 days of email history", value=True)
 
-        if st.button("Add User", use_container_width=True):
+        if st.button("Add User & Fetch Data", use_container_width=True, type="primary"):
             if new_email and "@" in new_email:
                 try:
                     supabase = get_supabase()
@@ -233,7 +266,20 @@ with st.sidebar:
                         "is_active": True
                     }).execute()
                     st.success(f"Added {new_email} to tracked users!")
-                    st.info("Run the tracker to fetch their email data: `python3 tracker_supabase.py`")
+
+                    # Trigger GitHub workflow to fetch data
+                    if os.getenv("GITHUB_TOKEN"):
+                        with st.spinner("Triggering data fetch..."):
+                            success, message = trigger_github_workflow(new_email, backfill=fetch_history)
+                            if success:
+                                st.success("Data fetch started! It will take a few minutes to complete.")
+                                st.info("Refresh the dashboard in 3-5 minutes to see their data.")
+                            else:
+                                st.warning(f"Could not auto-fetch: {message}")
+                                st.info("You can manually trigger it from GitHub Actions.")
+                    else:
+                        st.info("To enable auto-fetch, add GITHUB_TOKEN to your .env file.")
+
                     st.cache_resource.clear()
                 except Exception as e:
                     if "duplicate" in str(e).lower():
@@ -242,6 +288,33 @@ with st.sidebar:
                         st.error(f"Error adding user: {e}")
             else:
                 st.warning("Please enter a valid email address.")
+
+    # Manual sync button for existing users
+    with st.expander("Sync Data for Existing User"):
+        if os.getenv("GITHUB_TOKEN"):
+            try:
+                supabase = get_supabase()
+                users_result = supabase.table("tracked_users").select("email").eq("is_active", True).execute()
+                user_emails = [u["email"] for u in users_result.data] if users_result.data else []
+
+                if user_emails:
+                    sync_email = st.selectbox("Select user to sync", user_emails)
+                    sync_backfill = st.checkbox("Include 90 days history", value=False)
+
+                    if st.button("Fetch Latest Data", use_container_width=True):
+                        with st.spinner("Triggering data fetch..."):
+                            success, message = trigger_github_workflow(sync_email, backfill=sync_backfill)
+                            if success:
+                                st.success(f"Data fetch started for {sync_email}!")
+                                st.info("Refresh in 3-5 minutes to see updated data.")
+                            else:
+                                st.error(message)
+                else:
+                    st.write("No users being tracked yet.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+        else:
+            st.info("Add GITHUB_TOKEN to .env to enable this feature.")
 
     # Show currently tracked users
     with st.expander("Currently Tracked Users"):

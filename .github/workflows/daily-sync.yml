@@ -4,7 +4,20 @@ on:
   schedule:
     # Runs at 6 AM UTC (10 PM PST, 1 AM EST)
     - cron: '0 6 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      user_email:
+        description: 'Specific user email to run for (leave empty for all users)'
+        required: false
+        default: ''
+      backfill:
+        description: 'Fetch more history (90 days)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   sync:
@@ -35,4 +48,12 @@ jobs:
           echo "GOOGLE_CREDENTIALS_FILE=credentials.json" >> .env
 
       - name: Run tracker
-        run: python tracker_supabase.py
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.user_email }}" ]; then
+            ARGS="$ARGS --user ${{ github.event.inputs.user_email }}"
+          fi
+          if [ "${{ github.event.inputs.backfill }}" == "true" ]; then
+            ARGS="$ARGS --backfill"
+          fi
+          python tracker_supabase.py $ARGS
