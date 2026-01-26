@@ -214,8 +214,53 @@ with st.sidebar:
         st.session_state.refresh_counter += 1
         st.rerun()
 
+    st.divider()
+
+    # Manage Tracked Users
+    st.subheader("Manage Team")
+
+    with st.expander("Add New User to Track"):
+        new_email = st.text_input("Email Address", placeholder="user@lumiere.education")
+        new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
+
+        if st.button("Add User", use_container_width=True):
+            if new_email and "@" in new_email:
+                try:
+                    supabase = get_supabase()
+                    supabase.table("tracked_users").insert({
+                        "email": new_email,
+                        "display_name": new_name if new_name else None,
+                        "is_active": True
+                    }).execute()
+                    st.success(f"Added {new_email} to tracked users!")
+                    st.info("Run the tracker to fetch their email data: `python3 tracker_supabase.py`")
+                    st.cache_resource.clear()
+                except Exception as e:
+                    if "duplicate" in str(e).lower():
+                        st.warning(f"{new_email} is already being tracked.")
+                    else:
+                        st.error(f"Error adding user: {e}")
+            else:
+                st.warning("Please enter a valid email address.")
+
+    # Show currently tracked users
+    with st.expander("Currently Tracked Users"):
+        try:
+            supabase = get_supabase()
+            users = supabase.table("tracked_users").select("email, display_name, is_active").execute()
+            if users.data:
+                for user in users.data:
+                    status = "✅" if user["is_active"] else "❌"
+                    name = f" ({user['display_name']})" if user.get('display_name') else ""
+                    st.write(f"{status} {user['email']}{name}")
+            else:
+                st.write("No users being tracked.")
+        except Exception as e:
+            st.error(f"Error loading users: {e}")
+
 # Main Area
 st.title("Lumiere Email Response Dashboard")
+st.caption("📅 Data refreshes automatically every day at 1:00 AM EST")
 
 # Fetch data with spinner
 with st.spinner("Fetching data from Supabase..."):

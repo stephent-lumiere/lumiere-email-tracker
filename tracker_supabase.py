@@ -2,8 +2,15 @@
 """
 Email Response Time Tracker - Supabase Edition
 Fetches email response times and stores them in Supabase.
+
+Usage:
+    python3 tracker_supabase.py                    # Run for all tracked users
+    python3 tracker_supabase.py --user email@x.com # Run for specific user
+    python3 tracker_supabase.py --backfill         # Fetch more history (2000 threads)
+    python3 tracker_supabase.py --user email@x.com --backfill  # Backfill specific user
 """
 
+import argparse
 import os
 import threading
 import warnings
@@ -29,8 +36,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 
-MAX_THREADS = 500  # Threads to fetch per user
-MAX_WORKERS = 20   # Parallel workers
+MAX_THREADS_DEFAULT = 500   # Normal run
+MAX_THREADS_BACKFILL = 2000 # Backfill run (covers ~90 days)
+MAX_WORKERS = 20            # Parallel workers
 
 # Noise filters - emails to exclude
 EXCLUDE = [
@@ -157,7 +165,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
     return result
 
 
-def fetch_user_responses(user_email: str) -> list:
+def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT) -> dict:
     """Fetch all response pairs for a user."""
     print(f"\n{'='*60}")
     print(f"Processing: {user_email}")
@@ -175,7 +183,7 @@ def fetch_user_responses(user_email: str) -> list:
     page_token = None
     query = "from:(-lumiere.education) -from:mailer-daemon -from:postmaster -from:noreply -from:notifications"
 
-    while len(all_threads) < MAX_THREADS:
+    while len(all_threads) < max_threads:
         try:
             results = gmail.users().threads().list(
                 userId="me", q=query, maxResults=100, pageToken=page_token
@@ -189,7 +197,7 @@ def fetch_user_responses(user_email: str) -> list:
             print(f"  Error listing threads: {e}")
             break
 
-    all_threads = all_threads[:MAX_THREADS]
+    all_threads = all_threads[:max_threads]
     print(f"  Found {len(all_threads)} threads")
 
     if not all_threads:
@@ -323,20 +331,34 @@ def get_tracked_users() -> list:
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Fetch email response times and store in Supabase")
+    parser.add_argument("--user", help="Run for a specific user email only")
+    parser.add_argument("--backfill", action="store_true", help="Fetch more history (2000 threads instead of 500)")
+    args = parser.parse_args()
+
+    max_threads = MAX_THREADS_BACKFILL if args.backfill else MAX_THREADS_DEFAULT
+
     print("=" * 60)
     print("Lumiere Email Tracker - Supabase Edition")
+    if args.backfill:
+        print("MODE: BACKFILL (fetching up to 2000 threads per user)")
     print("=" * 60)
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Get tracked users from database
-    users = get_tracked_users()
-    print(f"\nTracking {len(users)} users: {', '.join(users)}")
+    if args.user:
+        users = [args.user]
+        print(f"\nRunning for specific user: {args.user}")
+    else:
+        users = get_tracked_users()
+        print(f"\nTracking {len(users)} users: {', '.join(users)}")
 
     total_pairs = 0
     total_new = 0
 
     for user_email in users:
-        result = fetch_user_responses(user_email)
+        result = fetch_user_responses(user_email, max_threads=max_threads)
         pairs = result["pairs"]
         received = result["received"]
         sent = result["sent"]
