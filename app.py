@@ -31,6 +31,11 @@ def check_gmail_access(user_email: str) -> tuple[bool, str]:
 
         credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 
+        # If credentials file doesn't exist (e.g., on Streamlit Cloud), skip the check
+        # The actual verification will happen when GitHub Actions runs
+        if not os.path.exists(credentials_file):
+            return True, "Skipped (no local credentials)"
+
         credentials = service_account.Credentials.from_service_account_file(
             credentials_file,
             scopes=["https://www.googleapis.com/auth/gmail.readonly"]
