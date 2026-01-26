@@ -333,7 +333,7 @@ with tab_manage:
         new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
         team_function = st.selectbox(
             "Team Function",
-            options=["operations", "growth"],
+            options=["operations", "growth", "other"],
             index=0,
             help="Select the team this user belongs to"
         )
