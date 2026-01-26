@@ -607,6 +607,32 @@ with tab_dashboard:
 
         st.plotly_chart(fig_ranking, use_container_width=True)
 
+    # Show response pairs when a single individual is selected
+    if selected_individual != "All Individuals":
+        st.divider()
+
+        col_header, col_limit = st.columns([3, 1])
+        with col_header:
+            st.subheader("Recent Tracked Response Pairs")
+            st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}")
+        with col_limit:
+            num_pairs = st.selectbox(
+                "Show",
+                options=[10, 25, 50, 100],
+                index=0,
+                key="num_pairs_selector"
+            )
+
+        recent_pairs = get_recent_response_pairs(selected_individual, start_date, end_date, limit=num_pairs)
+
+        if not recent_pairs.empty:
+            st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_time']].copy()
+            display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response Time']
+            st.dataframe(display_pairs, use_container_width=True, hide_index=True)
+        else:
+            st.info("No response pairs found for this user in this time period.")
+
     # Understanding metrics at the bottom
     st.divider()
     with st.expander("📊 Understanding the Metrics"):
