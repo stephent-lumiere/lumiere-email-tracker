@@ -632,8 +632,9 @@ with tab_dashboard:
 
         if not recent_pairs.empty:
             st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_time']].copy()
-            display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response Time']
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time']].copy()
+            display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']
+            display_pairs['Response (hrs)'] = display_pairs['Response (hrs)'].round(1)
             st.dataframe(display_pairs, use_container_width=True, hide_index=True)
         else:
             st.info("No response pairs found for this user in this time period.")
