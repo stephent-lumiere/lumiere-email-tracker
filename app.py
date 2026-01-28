@@ -338,7 +338,7 @@ with tab_manage:
         new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
         team_function = st.selectbox(
             "Team Function",
-            options=["operations", "growth", "other"],
+            options=["Lumiere Operations", "Ladder Operations", "YFL Operations", "Horizon Operations", "Growth", "Other"],
             index=0,
             help="Select the team this user belongs to"
         )
@@ -431,7 +431,7 @@ with tab_manage:
         st.subheader("Currently Tracked")
         try:
             supabase = get_supabase()
-            users = supabase.table("tracked_users").select("email, display_name, domain, is_active").order("domain").execute()
+            users = supabase.table("tracked_users").select("email, display_name, domain, is_active, team_function").order("domain").execute()
             if users.data:
                 # Group by domain
                 domains = {}
@@ -446,11 +446,46 @@ with tab_manage:
                     for user in domain_users:
                         status = "✅" if user["is_active"] else "❌"
                         name = user.get('display_name') or user['email'].split('@')[0]
-                        st.write(f"  {status} {name}")
+                        team = user.get('team_function') or ''
+                        team_label = f" [{team}]" if team else ""
+                        st.write(f"  {status} {name}{team_label}")
             else:
                 st.write("No users being tracked yet.")
         except Exception as e:
             st.error(f"Error loading users: {e}")
+
+    st.divider()
+
+    st.subheader("Edit User Team")
+    st.caption("Change the team assignment for an existing tracked user")
+    try:
+        supabase_edit = get_supabase()
+        edit_users = supabase_edit.table("tracked_users").select("email, display_name, team_function").eq("is_active", True).order("email").execute()
+        if edit_users.data:
+            edit_col1, edit_col2, edit_col3 = st.columns([2, 2, 1])
+            edit_options = {
+                (u.get("display_name") or u["email"].split("@")[0]) + f" ({u['email']})": u["email"]
+                for u in edit_users.data
+            }
+            with edit_col1:
+                selected_label = st.selectbox("Select user", list(edit_options.keys()), key="edit_team_user")
+            with edit_col2:
+                new_team = st.selectbox(
+                    "New team",
+                    options=["Lumiere Operations", "Ladder Operations", "YFL Operations", "Horizon Operations", "Growth", "Other"],
+                    key="edit_team_value"
+                )
+            with edit_col3:
+                st.write("")  # spacing
+                if st.button("Update Team", use_container_width=True, key="edit_team_btn"):
+                    selected_email = edit_options[selected_label]
+                    supabase_edit.table("tracked_users").update({"team_function": new_team}).eq("email", selected_email).execute()
+                    st.success(f"Updated team for {selected_email} to {new_team}")
+                    st.cache_resource.clear()
+        else:
+            st.write("No active users to edit.")
+    except Exception as e:
+        st.error(f"Error loading users: {e}")
 
     st.divider()
 
