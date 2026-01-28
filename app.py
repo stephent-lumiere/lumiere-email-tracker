@@ -195,12 +195,11 @@ def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.Dat
 def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10) -> pd.DataFrame:
     """
     Fetch the most recent response pairs for a specific user within a date range.
-    Excludes pairs that have been manually excluded.
     """
     supabase = get_supabase()
 
     result = supabase.table("response_pairs").select(
-        "id, thread_id, external_sender, subject, received_at, replied_at, response_hours"
+        "external_sender, subject, received_at, replied_at, response_hours"
     ).eq(
         "user_email", user_email
     ).gte(
@@ -214,29 +213,7 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
     if not result.data:
         return pd.DataFrame()
 
-    # Filter out excluded pairs
-    excluded_result = supabase.table("excluded_response_pairs").select(
-        "thread_id, replied_at"
-    ).eq("user_email", user_email).execute()
-
-    excluded_keys = set()
-    if excluded_result.data:
-        for ep in excluded_result.data:
-            excluded_keys.add((ep["thread_id"], ep["replied_at"]))
-
-    filtered_data = [
-        row for row in result.data
-        if (row["thread_id"], row["replied_at"]) not in excluded_keys
-    ]
-
-    if not filtered_data:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(filtered_data)
-
-    # Keep raw timestamps for exclusion logic
-    df['raw_received_at'] = df['received_at']
-    df['raw_replied_at'] = df['replied_at']
+    df = pd.DataFrame(result.data)
 
     # Format the data for display
     df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
@@ -507,43 +484,6 @@ with tab_manage:
     else:
         st.info("Add GITHUB_TOKEN to .env to enable manual sync.")
 
-    st.divider()
-
-    st.subheader("Excluded Response Pairs")
-    st.caption("Pairs excluded from response time calculations. Click Restore to re-include a pair.")
-
-    try:
-        from tracker_supabase import get_excluded_pairs, restore_response_pair, recalculate_daily_stats
-        excluded = get_excluded_pairs()
-        if excluded:
-            for i, pair in enumerate(excluded):
-                col_info, col_action = st.columns([4, 1])
-                with col_info:
-                    sender = (pair.get("external_sender") or "")[:35]
-                    subject = (pair.get("subject") or "")[:40]
-                    user = pair.get("user_email", "")
-                    hours = pair.get("response_hours")
-                    hours_str = f"{hours:.1f}h" if hours is not None else "N/A"
-                    excluded_at = pair.get("excluded_at", "")[:10]
-                    st.text(f"{user} | {sender} | {subject} | {hours_str} | excluded {excluded_at}")
-                with col_action:
-                    if st.button("Restore", key=f"restore_{pair['id']}"):
-                        try:
-                            restore_response_pair(pair["id"])
-                            # Recalculate stats for affected date
-                            if pair.get("replied_at"):
-                                dt = pd.to_datetime(pair["replied_at"])
-                                recalculate_daily_stats(pair["user_email"], [dt.strftime("%Y-%m-%d")])
-                            st.success("Pair restored. Stats recalculated.")
-                            st.cache_resource.clear()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error restoring pair: {e}")
-        else:
-            st.info("No excluded pairs.")
-    except Exception as e:
-        st.error(f"Error loading excluded pairs: {e}")
-
 with tab_dashboard:
     # Fetch data with spinner
     with st.spinner("Fetching data from Supabase..."):
@@ -695,56 +635,7 @@ with tab_dashboard:
             display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time']].copy()
             display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']
             display_pairs['Response (hrs)'] = display_pairs['Response (hrs)'].round(1)
-            display_pairs.insert(0, 'Exclude', False)
-
-            edited_pairs = st.data_editor(
-                display_pairs,
-                use_container_width=True,
-                hide_index=True,
-                disabled=['External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time'],
-                column_config={
-                    "Exclude": st.column_config.CheckboxColumn("Exclude", default=False),
-                    "Response (hrs)": st.column_config.NumberColumn("Response (hrs)", format="%.1f"),
-                },
-                key="response_pairs_editor"
-            )
-
-            if st.button("Exclude Selected Pairs", type="secondary"):
-                from tracker_supabase import exclude_response_pair, recalculate_daily_stats
-                selected_mask = edited_pairs['Exclude'] == True
-                if selected_mask.any():
-                    excluded_count = 0
-                    affected_dates = set()
-                    for idx in edited_pairs[selected_mask].index:
-                        row = recent_pairs.iloc[idx]
-                        pair_data = {
-                            "user_email": selected_individual,
-                            "external_sender": row["external_sender"],
-                            "subject": row["subject"],
-                            "received_at": row["raw_received_at"],
-                            "replied_at": row["raw_replied_at"],
-                            "response_hours": float(row["response_hours"]),
-                            "thread_id": row["thread_id"],
-                        }
-                        try:
-                            exclude_response_pair(pair_data)
-                            excluded_count += 1
-                            dt = pd.to_datetime(row["raw_replied_at"])
-                            affected_dates.add(dt.strftime("%Y-%m-%d"))
-                        except Exception as e:
-                            st.error(f"Error excluding pair: {e}")
-
-                    if excluded_count > 0 and affected_dates:
-                        try:
-                            recalculate_daily_stats(selected_individual, list(affected_dates))
-                        except Exception as e:
-                            st.warning(f"Stats recalculation error: {e}")
-
-                        st.success(f"Excluded {excluded_count} pair(s). Stats recalculated.")
-                        st.cache_resource.clear()
-                        st.rerun()
-                else:
-                    st.warning("No pairs selected. Check the 'Exclude' boxes first.")
+            st.dataframe(display_pairs, use_container_width=True, hide_index=True)
         else:
             st.info("No response pairs found for this user in this time period.")
 
