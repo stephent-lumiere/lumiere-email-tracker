@@ -15,9 +15,10 @@ import os
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time as dt_time
 from email.utils import parsedate_to_datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -87,6 +88,121 @@ def is_internal_email(email: str) -> bool:
     """Check if an email is from an internal domain."""
     return any(domain in email for domain in get_internal_domains())
 
+
+def get_user_work_settings(user_email: str) -> dict:
+    """Fetch work schedule settings for a user."""
+    supabase = get_supabase()
+    result = supabase.table("tracked_users").select(
+        "work_start_time, work_end_time, timezone, exclude_weekends"
+    ).eq("email", user_email).execute()
+
+    if result.data:
+        settings = result.data[0]
+        start_str = settings.get("work_start_time") or "09:00"
+        end_str = settings.get("work_end_time") or "17:00"
+        # Handle time strings (could be "09:00" or "09:00:00")
+        start_parts = start_str.split(":")
+        end_parts = end_str.split(":")
+        return {
+            "work_start": dt_time(int(start_parts[0]), int(start_parts[1])),
+            "work_end": dt_time(int(end_parts[0]), int(end_parts[1])),
+            "timezone": settings.get("timezone") or "America/New_York",
+            "exclude_weekends": settings.get("exclude_weekends", True),
+        }
+    return {
+        "work_start": dt_time(9, 0),
+        "work_end": dt_time(17, 0),
+        "timezone": "America/New_York",
+        "exclude_weekends": True,
+    }
+
+
+def get_user_ooo_dates(user_email: str) -> set:
+    """Fetch all OOO dates for a user as a set of date objects."""
+    supabase = get_supabase()
+    result = supabase.table("user_out_of_office").select(
+        "start_date, end_date"
+    ).eq("user_email", user_email).execute()
+
+    ooo_dates = set()
+    if result.data:
+        for row in result.data:
+            start = datetime.fromisoformat(row["start_date"]).date()
+            end = datetime.fromisoformat(row["end_date"]).date()
+            current = start
+            while current <= end:
+                ooo_dates.add(current)
+                current += timedelta(days=1)
+    return ooo_dates
+
+
+def calculate_adjusted_hours(
+    received_at: datetime,
+    replied_at: datetime,
+    work_start: dt_time,
+    work_end: dt_time,
+    user_tz: str,
+    exclude_weekends: bool,
+    ooo_dates: set
+) -> float:
+    """
+    Calculate working hours between received_at and replied_at.
+
+    Only counts time during working hours (work_start to work_end),
+    excludes weekends (if enabled), and excludes OOO dates.
+    """
+    try:
+        tz = ZoneInfo(user_tz)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    # Convert to user's timezone
+    received_local = received_at.astimezone(tz)
+    replied_local = replied_at.astimezone(tz)
+
+    # Work hours per day in seconds
+    work_start_seconds = work_start.hour * 3600 + work_start.minute * 60
+    work_end_seconds = work_end.hour * 3600 + work_end.minute * 60
+    work_day_seconds = work_end_seconds - work_start_seconds
+
+    if work_day_seconds <= 0:
+        # Invalid work hours config, return raw hours
+        return (replied_at - received_at).total_seconds() / 3600
+
+    total_work_seconds = 0
+    current_date = received_local.date()
+    end_date = replied_local.date()
+
+    while current_date <= end_date:
+        # Skip weekends if configured
+        if exclude_weekends and current_date.weekday() >= 5:
+            current_date += timedelta(days=1)
+            continue
+
+        # Skip OOO dates
+        if current_date in ooo_dates:
+            current_date += timedelta(days=1)
+            continue
+
+        # Calculate work seconds for this day
+        day_start = datetime.combine(current_date, work_start, tzinfo=tz)
+        day_end = datetime.combine(current_date, work_end, tzinfo=tz)
+
+        # Clamp to received/replied times
+        if current_date == received_local.date():
+            day_start = max(day_start, received_local)
+        if current_date == replied_local.date():
+            day_end = min(day_end, replied_local)
+
+        # Only count if there's positive time
+        if day_end > day_start:
+            total_work_seconds += (day_end - day_start).total_seconds()
+
+        current_date += timedelta(days=1)
+
+    return total_work_seconds / 3600
+
+
 # Thread-local storage for Gmail service
 _thread_local = threading.local()
 
@@ -133,7 +249,7 @@ def fetch_thread(user_email: str, thread_id: str) -> Optional[dict]:
     return None
 
 
-def process_thread(thread_data: dict, user_email: str) -> dict:
+def process_thread(thread_data: dict, user_email: str, work_settings: dict = None, ooo_dates: set = None) -> dict:
     """Extract ALL external→user response pairs from a thread, plus email counts."""
     msgs = thread_data.get("messages", [])
 
@@ -202,6 +318,19 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
                 if parsed[j]["email"] == user_email_lower:
                     hours = (parsed[j]["date"] - m["date"]).total_seconds() / 3600
 
+                    # Calculate adjusted hours if work settings provided
+                    adjusted_hours = None
+                    if work_settings:
+                        adjusted_hours = calculate_adjusted_hours(
+                            m["date"],
+                            parsed[j]["date"],
+                            work_settings["work_start"],
+                            work_settings["work_end"],
+                            work_settings["timezone"],
+                            work_settings["exclude_weekends"],
+                            ooo_dates or set()
+                        )
+
                     result["pairs"].append({
                         "user_email": user_email,
                         "external_sender": m["email"][:200],
@@ -209,6 +338,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
                         "received_at": m["date"].isoformat(),
                         "replied_at": parsed[j]["date"].isoformat(),
                         "response_hours": round(hours, 2),
+                        "adjusted_response_hours": round(adjusted_hours, 2) if adjusted_hours is not None else None,
                         "thread_id": thread_id,
                     })
                     break  # Only first reply to each external message
@@ -287,6 +417,10 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
 
     print(f"  Fetched {len(thread_data)} thread details")
 
+    # Fetch work settings and OOO dates for adjusted calculation
+    work_settings = get_user_work_settings(user_email)
+    ooo_dates = get_user_ooo_dates(user_email)
+
     # Process threads
     print(f"  Processing threads...")
     all_pairs = []
@@ -295,7 +429,7 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     all_received_emails = []
 
     for data in thread_data:
-        result = process_thread(data, user_email)
+        result = process_thread(data, user_email, work_settings, ooo_dates)
         all_pairs.extend(result["pairs"])
         all_received.extend(result["received"])
         all_sent.extend(result["sent"])
@@ -381,6 +515,7 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
     # Group data by date
     from collections import defaultdict, Counter
     daily_hours = defaultdict(list)
+    daily_adjusted_hours = defaultdict(list)
     received_counts = Counter(received)
     sent_counts = Counter(sent)
 
@@ -389,6 +524,9 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
         replied_at = datetime.fromisoformat(p["replied_at"].replace("Z", "+00:00"))
         date_str = replied_at.date().isoformat()
         daily_hours[date_str].append(p["response_hours"])
+        # Track adjusted hours if available
+        if p.get("adjusted_response_hours") is not None:
+            daily_adjusted_hours[date_str].append(p["adjusted_response_hours"])
 
     # Get all dates that have any activity
     all_dates = set(daily_hours.keys()) | set(received_counts.keys()) | set(sent_counts.keys())
@@ -416,6 +554,15 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
             stats["min_response_hours"] = round(min(hours_list), 2)
             stats["max_response_hours"] = round(max(hours_list), 2)
 
+        # Add adjusted hours stats if available
+        adjusted_list = daily_adjusted_hours.get(date_str, [])
+        if adjusted_list:
+            sorted_adjusted = sorted(adjusted_list)
+            n_adj = len(sorted_adjusted)
+            median_adj = sorted_adjusted[n_adj // 2] if n_adj % 2 == 1 else (sorted_adjusted[n_adj//2 - 1] + sorted_adjusted[n_adj//2]) / 2
+            stats["avg_adjusted_hours"] = round(sum(adjusted_list) / n_adj, 2)
+            stats["median_adjusted_hours"] = round(median_adj, 2)
+
         try:
             supabase.table("daily_stats").upsert(
                 stats,
@@ -430,6 +577,95 @@ def get_tracked_users() -> list:
     supabase = get_supabase()
     result = supabase.table("tracked_users").select("email").eq("is_active", True).execute()
     return [row["email"] for row in result.data] if result.data else []
+
+
+def exclude_response_pair(pair_data: dict):
+    """Insert a response pair into the excluded_response_pairs table."""
+    supabase = get_supabase()
+    supabase.table("excluded_response_pairs").upsert(
+        pair_data,
+        on_conflict="thread_id,replied_at"
+    ).execute()
+
+
+def restore_response_pair(excluded_id: str):
+    """Remove a pair from excluded_response_pairs by its id."""
+    supabase = get_supabase()
+    supabase.table("excluded_response_pairs").delete().eq("id", excluded_id).execute()
+
+
+def get_excluded_pairs(user_email: str = None) -> list:
+    """Fetch excluded pairs, optionally filtered by user."""
+    supabase = get_supabase()
+    query = supabase.table("excluded_response_pairs").select("*")
+    if user_email:
+        query = query.eq("user_email", user_email)
+    result = query.order("excluded_at", desc=True).execute()
+    return result.data if result.data else []
+
+
+def recalculate_daily_stats(user_email: str, dates: list):
+    """Recalculate daily_stats for specific user+dates after exclusion/restoration."""
+    from collections import defaultdict
+    supabase = get_supabase()
+
+    for date_str in dates:
+        # Get all response pairs for this user+date
+        pairs_result = supabase.table("response_pairs").select(
+            "response_hours, thread_id, replied_at"
+        ).eq(
+            "user_email", user_email
+        ).gte(
+            "replied_at", date_str + "T00:00:00"
+        ).lte(
+            "replied_at", date_str + "T23:59:59"
+        ).execute()
+
+        # Get excluded pairs for this user
+        excluded_result = supabase.table("excluded_response_pairs").select(
+            "thread_id, replied_at"
+        ).eq("user_email", user_email).execute()
+
+        excluded_keys = set()
+        if excluded_result.data:
+            for ep in excluded_result.data:
+                excluded_keys.add((ep["thread_id"], ep["replied_at"]))
+
+        # Filter out excluded pairs
+        hours_list = []
+        if pairs_result.data:
+            for p in pairs_result.data:
+                if (p["thread_id"], p["replied_at"]) not in excluded_keys:
+                    hours_list.append(p["response_hours"])
+
+        # Update stats for this date
+        stats_update = {
+            "response_pairs_count": len(hours_list),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if hours_list:
+            sorted_hours = sorted(hours_list)
+            n = len(sorted_hours)
+            median = sorted_hours[n // 2] if n % 2 == 1 else (sorted_hours[n//2 - 1] + sorted_hours[n//2]) / 2
+            stats_update["avg_response_hours"] = round(sum(hours_list) / n, 2)
+            stats_update["median_response_hours"] = round(median, 2)
+            stats_update["min_response_hours"] = round(min(hours_list), 2)
+            stats_update["max_response_hours"] = round(max(hours_list), 2)
+        else:
+            stats_update["avg_response_hours"] = None
+            stats_update["median_response_hours"] = None
+            stats_update["min_response_hours"] = None
+            stats_update["max_response_hours"] = None
+
+        try:
+            supabase.table("daily_stats").update(stats_update).eq(
+                "user_email", user_email
+            ).eq(
+                "date", date_str
+            ).execute()
+        except Exception as e:
+            print(f"  Error updating daily stats for {date_str}: {e}")
 
 
 def main():

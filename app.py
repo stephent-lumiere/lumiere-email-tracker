@@ -89,7 +89,7 @@ def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-def get_stats_from_supabase(start_date: date, end_date: date) -> pd.DataFrame:
+def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False) -> pd.DataFrame:
     """
     Fetch aggregated stats from Supabase daily_stats table.
     """
@@ -107,14 +107,31 @@ def get_stats_from_supabase(start_date: date, end_date: date) -> pd.DataFrame:
 
     df = pd.DataFrame(result.data)
 
+    # Choose columns based on mode
+    avg_col = "avg_adjusted_hours" if use_adjusted else "avg_response_hours"
+    median_col = "median_adjusted_hours" if use_adjusted else "median_response_hours"
+
+    # Handle missing adjusted columns (for historical data)
+    if use_adjusted:
+        if avg_col not in df.columns:
+            df[avg_col] = df.get("avg_response_hours", 0)
+        if median_col not in df.columns:
+            df[median_col] = df.get("median_response_hours", 0)
+
     # Aggregate by user
     aggregated = df.groupby("user_email").agg({
         "emails_received": "sum",
         "emails_sent": "sum",
         "response_pairs_count": "sum",
-        "avg_response_hours": "mean",
-        "median_response_hours": "mean",
+        avg_col: "mean",
+        median_col: "mean",
     }).reset_index()
+
+    # Rename to standard column names for downstream processing
+    aggregated = aggregated.rename(columns={
+        avg_col: "avg_response_hours",
+        median_col: "median_response_hours",
+    })
 
     # Fetch user info (domain, display_name, team_function) from tracked_users
     users_result = supabase.table("tracked_users").select("email, domain, display_name, team_function").execute()
@@ -288,7 +305,7 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
     supabase = get_supabase()
 
     result = supabase.table("response_pairs").select(
-        "external_sender, subject, received_at, replied_at, response_hours"
+        "external_sender, subject, received_at, replied_at, response_hours, adjusted_response_hours"
     ).eq(
         "user_email", user_email
     ).gte(
@@ -389,6 +406,17 @@ with st.sidebar:
     # Show selected date range
     st.caption(f"{start_date.strftime('%b %d, %Y')} - {end_date.strftime('%b %d, %Y')}")
 
+    st.divider()
+
+    # Response Time Mode Toggle
+    response_time_mode = st.radio(
+        "Response Time Mode",
+        options=["Raw Time", "Working Hours Adjusted"],
+        index=0,
+        help="Raw shows actual elapsed time. Adjusted only counts time during working hours."
+    )
+    use_adjusted = response_time_mode == "Working Hours Adjusted"
+
     # Explainer for each time window
     st.divider()
     st.subheader("About This Data")
@@ -431,6 +459,22 @@ with tab_manage:
             index=0,
             help="Select the team this user belongs to"
         )
+
+        st.markdown("**Working Hours**")
+        work_col1, work_col2 = st.columns(2)
+        with work_col1:
+            work_start = st.time_input("Start Time", value=datetime.strptime("09:00", "%H:%M").time(), key="add_work_start")
+        with work_col2:
+            work_end = st.time_input("End Time", value=datetime.strptime("17:00", "%H:%M").time(), key="add_work_end")
+
+        timezone_options = [
+            "America/New_York", "America/Chicago", "America/Denver",
+            "America/Los_Angeles", "America/Phoenix", "Europe/London",
+            "Europe/Paris", "Asia/Tokyo", "Asia/Shanghai", "UTC"
+        ]
+        user_timezone = st.selectbox("Timezone", options=timezone_options, index=0, key="add_timezone")
+        exclude_weekends = st.checkbox("Exclude weekends from adjusted time", value=True, key="add_exclude_weekends")
+
         fetch_history = st.checkbox("Fetch 90 days of email history", value=True)
 
         if st.button("Add User & Fetch Data", use_container_width=True, type="primary"):
@@ -477,7 +521,11 @@ with tab_manage:
                             "display_name": new_name if new_name else None,
                             "domain": domain,
                             "team_function": team_function,
-                            "is_active": True
+                            "is_active": True,
+                            "work_start_time": work_start.strftime("%H:%M"),
+                            "work_end_time": work_end.strftime("%H:%M"),
+                            "timezone": user_timezone,
+                            "exclude_weekends": exclude_weekends,
                         }).execute()
                         st.success(f"✅ Added {new_email} to tracked users!")
 
@@ -578,6 +626,128 @@ with tab_manage:
 
     st.divider()
 
+    st.subheader("Edit Working Hours")
+    st.caption("Update working hours and timezone for a user")
+
+    try:
+        supabase_hours = get_supabase()
+        hours_users = supabase_hours.table("tracked_users").select(
+            "email, display_name, work_start_time, work_end_time, timezone, exclude_weekends"
+        ).eq("is_active", True).order("email").execute()
+
+        if hours_users.data:
+            hours_options = {
+                (u.get("display_name") or u["email"].split("@")[0]) + f" ({u['email']})": u
+                for u in hours_users.data
+            }
+
+            selected_hours_label = st.selectbox("Select user", list(hours_options.keys()), key="hours_user")
+            selected_hours_user = hours_options[selected_hours_label]
+
+            hours_col1, hours_col2 = st.columns(2)
+            with hours_col1:
+                current_start = datetime.strptime(selected_hours_user.get("work_start_time") or "09:00", "%H:%M").time()
+                new_work_start = st.time_input("Work Start", value=current_start, key="edit_work_start")
+            with hours_col2:
+                current_end = datetime.strptime(selected_hours_user.get("work_end_time") or "17:00", "%H:%M").time()
+                new_work_end = st.time_input("Work End", value=current_end, key="edit_work_end")
+
+            timezone_options = [
+                "America/New_York", "America/Chicago", "America/Denver",
+                "America/Los_Angeles", "America/Phoenix", "Europe/London",
+                "Europe/Paris", "Asia/Tokyo", "Asia/Shanghai", "UTC"
+            ]
+            current_tz = selected_hours_user.get("timezone") or "America/New_York"
+            current_tz_idx = timezone_options.index(current_tz) if current_tz in timezone_options else 0
+            new_timezone = st.selectbox("Timezone", options=timezone_options, index=current_tz_idx, key="edit_timezone")
+
+            new_exclude_weekends = st.checkbox(
+                "Exclude weekends",
+                value=selected_hours_user.get("exclude_weekends", True),
+                key="edit_exclude_weekends"
+            )
+
+            if st.button("Update Working Hours", use_container_width=True, key="update_hours_btn"):
+                supabase_hours.table("tracked_users").update({
+                    "work_start_time": new_work_start.strftime("%H:%M"),
+                    "work_end_time": new_work_end.strftime("%H:%M"),
+                    "timezone": new_timezone,
+                    "exclude_weekends": new_exclude_weekends,
+                }).eq("email", selected_hours_user["email"]).execute()
+                st.success(f"Updated working hours for {selected_hours_user['email']}")
+                st.cache_resource.clear()
+        else:
+            st.write("No active users to edit.")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+    st.divider()
+
+    st.subheader("Out of Office")
+    st.caption("Mark dates when a user is unavailable")
+
+    try:
+        supabase_ooo = get_supabase()
+        ooo_users = supabase_ooo.table("tracked_users").select("email, display_name").eq("is_active", True).order("email").execute()
+
+        if ooo_users.data:
+            ooo_options = {
+                (u.get("display_name") or u["email"].split("@")[0]) + f" ({u['email']})": u["email"]
+                for u in ooo_users.data
+            }
+
+            ooo_col1, ooo_col2 = st.columns(2)
+
+            with ooo_col1:
+                st.markdown("**Add OOO Period**")
+                selected_ooo_user = st.selectbox("User", list(ooo_options.keys()), key="ooo_user")
+                ooo_email = ooo_options[selected_ooo_user]
+
+                ooo_start = st.date_input("Start Date", key="ooo_start")
+                ooo_end = st.date_input("End Date", key="ooo_end")
+                ooo_description = st.text_input("Description (optional)", placeholder="Vacation, sick leave, etc.", key="ooo_desc")
+
+                if st.button("Add OOO Period", use_container_width=True, key="add_ooo_btn"):
+                    if ooo_end >= ooo_start:
+                        supabase_ooo.table("user_out_of_office").insert({
+                            "user_email": ooo_email,
+                            "start_date": ooo_start.isoformat(),
+                            "end_date": ooo_end.isoformat(),
+                            "description": ooo_description if ooo_description else None,
+                        }).execute()
+                        st.success(f"Added OOO period for {ooo_email}")
+                        st.cache_resource.clear()
+                    else:
+                        st.warning("End date must be on or after start date")
+
+            with ooo_col2:
+                st.markdown("**Current OOO Periods**")
+                # Show existing OOO for selected user
+                existing_ooo = supabase_ooo.table("user_out_of_office").select("*").eq(
+                    "user_email", ooo_email
+                ).order("start_date", desc=True).execute()
+
+                if existing_ooo.data:
+                    for ooo in existing_ooo.data:
+                        start = datetime.fromisoformat(ooo["start_date"]).strftime("%b %d, %Y")
+                        end = datetime.fromisoformat(ooo["end_date"]).strftime("%b %d, %Y")
+                        desc = ooo.get("description") or "No description"
+                        col_a, col_b = st.columns([3, 1])
+                        with col_a:
+                            st.write(f"{start} - {end}: {desc}")
+                        with col_b:
+                            if st.button("Delete", key=f"del_ooo_{ooo['id']}"):
+                                supabase_ooo.table("user_out_of_office").delete().eq("id", ooo["id"]).execute()
+                                st.rerun()
+                else:
+                    st.write("No OOO periods set")
+        else:
+            st.write("No active users.")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+    st.divider()
+
     st.subheader("Sync Existing User")
     st.caption("Manually trigger a data refresh for an existing user")
 
@@ -611,7 +781,7 @@ with tab_manage:
 with tab_dashboard:
     # Fetch data with spinner
     with st.spinner("Fetching data from Supabase..."):
-        df = get_stats_from_supabase(start_date, end_date)
+        df = get_stats_from_supabase(start_date, end_date, use_adjusted=use_adjusted)
 
     if df.empty:
         st.warning("No data found for the selected date range.")
