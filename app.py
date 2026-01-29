@@ -192,6 +192,95 @@ def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.Dat
     return pd.DataFrame(result.data)
 
 
+def get_received_emails(user_email: str, start_date: date, end_date: date, limit: int = 50) -> pd.DataFrame:
+    """
+    Fetch all received emails for a user within a date range.
+    """
+    supabase = get_supabase()
+
+    result = supabase.table("received_emails").select(
+        "sender_email, subject, received_at, replied, replied_at, response_hours"
+    ).eq(
+        "user_email", user_email
+    ).gte(
+        "received_at", start_date.isoformat()
+    ).lte(
+        "received_at", end_date.isoformat() + "T23:59:59"
+    ).order(
+        "received_at", desc=True
+    ).limit(limit).execute()
+
+    if not result.data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(result.data)
+
+    # Format timestamps
+    df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
+    df['replied_at'] = df['replied_at'].apply(
+        lambda x: pd.to_datetime(x).strftime('%b %d, %H:%M') if pd.notna(x) and x else ""
+    )
+
+    # Format response time
+    def format_response_time(hours):
+        if pd.isna(hours) or hours is None:
+            return ""
+        if hours < 1:
+            return f"{int(hours * 60)}m"
+        elif hours < 24:
+            return f"{int(hours)}h {int((hours % 1) * 60)}m"
+        else:
+            days = int(hours / 24)
+            remaining_hours = int(hours % 24)
+            return f"{days}d {remaining_hours}h"
+
+    df['response_time'] = df['response_hours'].apply(format_response_time)
+    df['replied'] = df['replied'].apply(lambda x: "Yes" if x else "No")
+
+    # Truncate long fields
+    df['sender_email'] = df['sender_email'].str[:35]
+    df['subject'] = df['subject'].str[:40]
+
+    return df
+
+
+def get_received_emails_stats(user_email: str, start_date: date, end_date: date) -> dict:
+    """
+    Get summary stats for received emails (total, replied, reply rate).
+    """
+    supabase = get_supabase()
+
+    # Get total count
+    total_result = supabase.table("received_emails").select(
+        "id", count="exact"
+    ).eq(
+        "user_email", user_email
+    ).gte(
+        "received_at", start_date.isoformat()
+    ).lte(
+        "received_at", end_date.isoformat() + "T23:59:59"
+    ).execute()
+
+    # Get replied count
+    replied_result = supabase.table("received_emails").select(
+        "id", count="exact"
+    ).eq(
+        "user_email", user_email
+    ).eq(
+        "replied", True
+    ).gte(
+        "received_at", start_date.isoformat()
+    ).lte(
+        "received_at", end_date.isoformat() + "T23:59:59"
+    ).execute()
+
+    total = total_result.count if total_result.count is not None else 0
+    replied = replied_result.count if replied_result.count is not None else 0
+    rate = (replied / total * 100) if total > 0 else 0
+
+    return {"total": total, "replied": replied, "rate": rate}
+
+
 def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10) -> pd.DataFrame:
     """
     Fetch the most recent response pairs for a specific user within a date range.

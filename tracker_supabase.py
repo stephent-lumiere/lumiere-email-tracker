@@ -137,7 +137,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
     """Extract ALL external→user response pairs from a thread, plus email counts."""
     msgs = thread_data.get("messages", [])
 
-    result = {"pairs": [], "received": [], "sent": []}
+    result = {"pairs": [], "received": [], "sent": [], "received_emails": []}
 
     if not msgs:
         return result
@@ -167,7 +167,7 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
 
     user_email_lower = user_email.lower()
 
-    # Count emails received and sent
+    # Count emails received and sent, and build received_emails records
     for m in parsed:
         date_str = m["date"].date().isoformat()
         is_from_user = m["email"] == user_email_lower
@@ -177,6 +177,17 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
             result["sent"].append(date_str)
         elif not is_noise and not is_internal_email(m["email"]):
             result["received"].append(date_str)
+            # Build a received_email record (replied info backfilled after pairs loop)
+            result["received_emails"].append({
+                "user_email": user_email,
+                "sender_email": m["email"][:200],
+                "subject": subject,
+                "received_at": m["date"].isoformat(),
+                "thread_id": thread_id,
+                "replied": False,
+                "replied_at": None,
+                "response_hours": None,
+            })
 
     # Find ALL external→user pairs (need at least 2 messages)
     if len(parsed) < 2:
@@ -201,6 +212,20 @@ def process_thread(thread_data: dict, user_email: str) -> dict:
                         "thread_id": thread_id,
                     })
                     break  # Only first reply to each external message
+
+    # Backfill replied info into received_emails from pairs
+    reply_lookup = {}
+    for p in result["pairs"]:
+        key = (p["thread_id"], p["received_at"])
+        reply_lookup[key] = p
+
+    for rec in result["received_emails"]:
+        key = (rec["thread_id"], rec["received_at"])
+        if key in reply_lookup:
+            p = reply_lookup[key]
+            rec["replied"] = True
+            rec["replied_at"] = p["replied_at"]
+            rec["response_hours"] = p["response_hours"]
 
     return result
 
@@ -267,15 +292,17 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     all_pairs = []
     all_received = []
     all_sent = []
+    all_received_emails = []
 
     for data in thread_data:
         result = process_thread(data, user_email)
         all_pairs.extend(result["pairs"])
         all_received.extend(result["received"])
         all_sent.extend(result["sent"])
+        all_received_emails.extend(result["received_emails"])
 
-    print(f"  Found {len(all_pairs)} response pairs, {len(all_received)} received, {len(all_sent)} sent")
-    return {"pairs": all_pairs, "received": all_received, "sent": all_sent}
+    print(f"  Found {len(all_pairs)} response pairs, {len(all_received)} received, {len(all_sent)} sent, {len(all_received_emails)} received emails")
+    return {"pairs": all_pairs, "received": all_received, "sent": all_sent, "received_emails": all_received_emails}
 
 
 def save_to_supabase(pairs: list) -> int:
@@ -308,6 +335,38 @@ def save_to_supabase(pairs: list) -> int:
             new_count += len(result.data) if result.data else 0
         except Exception as e:
             print(f"  Error inserting batch: {e}")
+
+    return new_count
+
+
+def save_received_emails(received_emails: list) -> int:
+    """Save received emails to Supabase. Returns count of new records."""
+    if not received_emails:
+        return 0
+
+    # Dedupe by (thread_id, received_at)
+    seen = set()
+    unique = []
+    for r in received_emails:
+        key = (r["thread_id"], r["received_at"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    supabase = get_supabase()
+    new_count = 0
+
+    batch_size = 100
+    for i in range(0, len(unique), batch_size):
+        batch = unique[i:i + batch_size]
+        try:
+            result = supabase.table("received_emails").upsert(
+                batch,
+                on_conflict="thread_id,received_at"
+            ).execute()
+            new_count += len(result.data) if result.data else 0
+        except Exception as e:
+            print(f"  Error inserting received_emails batch: {e}")
 
     return new_count
 
@@ -400,18 +459,27 @@ def main():
     total_pairs = 0
     total_new = 0
 
+    total_received_emails = 0
+
     for user_email in users:
         result = fetch_user_responses(user_email, max_threads=max_threads)
         pairs = result["pairs"]
         received = result["received"]
         sent = result["sent"]
+        received_emails = result["received_emails"]
 
         if pairs:
-            print(f"  Saving to Supabase...")
+            print(f"  Saving response pairs to Supabase...")
             new_count = save_to_supabase(pairs)
-            print(f"  Saved {new_count} new records")
+            print(f"  Saved {new_count} new response pair records")
             total_pairs += len(pairs)
             total_new += new_count
+
+        if received_emails:
+            print(f"  Saving received emails to Supabase...")
+            re_count = save_received_emails(received_emails)
+            print(f"  Saved {re_count} received email records")
+            total_received_emails += len(received_emails)
 
         if pairs or received or sent:
             print(f"  Updating daily stats...")
@@ -421,7 +489,8 @@ def main():
     print(f"COMPLETE")
     print(f"{'='*60}")
     print(f"Total response pairs processed: {total_pairs}")
-    print(f"New records saved: {total_new}")
+    print(f"New response pair records saved: {total_new}")
+    print(f"Total received emails processed: {total_received_emails}")
     print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
