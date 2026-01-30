@@ -694,10 +694,12 @@ with tab_manage:
 
             hours_col1, hours_col2 = st.columns(2)
             with hours_col1:
-                current_start = datetime.strptime(selected_hours_user.get("work_start_time") or "09:00", "%H:%M").time()
+                start_str = (selected_hours_user.get("work_start_time") or "09:00")[:5]  # Handle HH:MM:SS
+                current_start = datetime.strptime(start_str, "%H:%M").time()
                 new_work_start = st.time_input("Work Start", value=current_start, key="edit_work_start")
             with hours_col2:
-                current_end = datetime.strptime(selected_hours_user.get("work_end_time") or "17:00", "%H:%M").time()
+                end_str = (selected_hours_user.get("work_end_time") or "17:00")[:5]  # Handle HH:MM:SS
+                current_end = datetime.strptime(end_str, "%H:%M").time()
                 new_work_end = st.time_input("Work End", value=current_end, key="edit_work_end")
 
             timezone_options = [
