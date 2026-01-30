@@ -134,41 +134,61 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         "response_pairs_count": "sum",
     }).reset_index()
 
-    # Compute correct weighted average from daily stats
-    # (weight each day's average by its response_pairs_count)
-    def compute_weighted_avg(group):
-        weights = group["response_pairs_count"]
-        values = group[avg_col]
-        mask = (weights > 0) & values.notna()
-        if mask.any():
-            return (values[mask] * weights[mask]).sum() / weights[mask].sum()
-        return None
-
-    weighted_avgs = df.groupby("user_email").apply(compute_weighted_avg).reset_index()
-    weighted_avgs.columns = ["user_email", "avg_response_hours"]
-    aggregated = aggregated.merge(weighted_avgs, on="user_email", how="left")
-
-    # Compute true median from response_pairs table (not mean of daily medians)
+    # Compute true average and median from response_pairs table directly
+    # (daily_stats aggregation loses accuracy due to equal-weight-per-day averaging)
     hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
     try:
+        # Fetch all response pairs (override default 1000 row limit)
         pairs_result = supabase.table("response_pairs").select(
-            "user_email, " + hours_col
+            "user_email, thread_id, replied_at, " + hours_col
         ).gte(
             "replied_at", start_date.isoformat()
         ).lte(
             "replied_at", end_date.isoformat() + "T23:59:59"
+        ).limit(10000).execute()
+
+        # Fetch excluded pairs to filter them out
+        excluded_result = supabase.table("excluded_response_pairs").select(
+            "thread_id, replied_at"
         ).execute()
+
+        excluded_keys = set()
+        if excluded_result.data:
+            for ep in excluded_result.data:
+                excluded_keys.add((ep["thread_id"], ep["replied_at"]))
 
         if pairs_result.data:
             pairs_df = pd.DataFrame(pairs_result.data)
+
+            # Filter out excluded pairs
+            if excluded_keys:
+                pairs_df = pairs_df[
+                    ~pairs_df.apply(lambda r: (r["thread_id"], r["replied_at"]) in excluded_keys, axis=1)
+                ]
+
             pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
-            true_medians = pairs_df.groupby("user_email")[hours_col].median().reset_index()
-            true_medians.columns = ["user_email", "median_response_hours"]
-            aggregated = aggregated.merge(true_medians, on="user_email", how="left")
+
+            # Compute both average and median per user from raw pairs
+            user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
+            user_stats.columns = ["user_email", "avg_response_hours", "median_response_hours"]
+            aggregated = aggregated.merge(user_stats, on="user_email", how="left")
         else:
+            aggregated["avg_response_hours"] = None
             aggregated["median_response_hours"] = None
-    except Exception:
-        # Fallback: use weighted average as a proxy for median
+    except Exception as e:
+        print(f"Error computing stats from response_pairs: {e}")
+        # Fallback: compute weighted average from daily_stats
+        def compute_weighted_avg(group):
+            weights = group["response_pairs_count"]
+            values = group[avg_col]
+            mask = (weights > 0) & values.notna()
+            if mask.any():
+                return (values[mask] * weights[mask]).sum() / weights[mask].sum()
+            return None
+
+        weighted_avgs = df.groupby("user_email").apply(compute_weighted_avg).reset_index()
+        weighted_avgs.columns = ["user_email", "avg_response_hours"]
+        aggregated = aggregated.merge(weighted_avgs, on="user_email", how="left")
         aggregated["median_response_hours"] = aggregated["avg_response_hours"]
 
     # Fetch user info (domain, display_name, team_function) from tracked_users
