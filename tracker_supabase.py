@@ -90,49 +90,58 @@ def is_internal_email(email: str) -> bool:
 
 
 def get_user_work_settings(user_email: str) -> dict:
-    """Fetch work schedule settings for a user."""
-    supabase = get_supabase()
-    result = supabase.table("tracked_users").select(
-        "work_start_time, work_end_time, timezone, exclude_weekends"
-    ).eq("email", user_email).execute()
-
-    if result.data:
-        settings = result.data[0]
-        start_str = settings.get("work_start_time") or "09:00"
-        end_str = settings.get("work_end_time") or "17:00"
-        # Handle time strings (could be "09:00" or "09:00:00")
-        start_parts = start_str.split(":")
-        end_parts = end_str.split(":")
-        return {
-            "work_start": dt_time(int(start_parts[0]), int(start_parts[1])),
-            "work_end": dt_time(int(end_parts[0]), int(end_parts[1])),
-            "timezone": settings.get("timezone") or "America/New_York",
-            "exclude_weekends": settings.get("exclude_weekends", True),
-        }
-    return {
+    """Fetch work schedule settings for a user. Returns defaults if columns don't exist."""
+    default_settings = {
         "work_start": dt_time(9, 0),
         "work_end": dt_time(17, 0),
         "timezone": "America/New_York",
         "exclude_weekends": True,
     }
+    try:
+        supabase = get_supabase()
+        result = supabase.table("tracked_users").select(
+            "work_start_time, work_end_time, timezone, exclude_weekends"
+        ).eq("email", user_email).execute()
+
+        if result.data:
+            settings = result.data[0]
+            start_str = settings.get("work_start_time") or "09:00"
+            end_str = settings.get("work_end_time") or "17:00"
+            # Handle time strings (could be "09:00" or "09:00:00")
+            start_parts = start_str.split(":")
+            end_parts = end_str.split(":")
+            return {
+                "work_start": dt_time(int(start_parts[0]), int(start_parts[1])),
+                "work_end": dt_time(int(end_parts[0]), int(end_parts[1])),
+                "timezone": settings.get("timezone") or "America/New_York",
+                "exclude_weekends": settings.get("exclude_weekends", True),
+            }
+    except Exception:
+        # Columns don't exist yet - migration not run
+        pass
+    return default_settings
 
 
 def get_user_ooo_dates(user_email: str) -> set:
-    """Fetch all OOO dates for a user as a set of date objects."""
-    supabase = get_supabase()
-    result = supabase.table("user_out_of_office").select(
-        "start_date, end_date"
-    ).eq("user_email", user_email).execute()
-
+    """Fetch all OOO dates for a user as a set of date objects. Returns empty set if table doesn't exist."""
     ooo_dates = set()
-    if result.data:
-        for row in result.data:
-            start = datetime.fromisoformat(row["start_date"]).date()
-            end = datetime.fromisoformat(row["end_date"]).date()
-            current = start
-            while current <= end:
-                ooo_dates.add(current)
-                current += timedelta(days=1)
+    try:
+        supabase = get_supabase()
+        result = supabase.table("user_out_of_office").select(
+            "start_date, end_date"
+        ).eq("user_email", user_email).execute()
+
+        if result.data:
+            for row in result.data:
+                start = datetime.fromisoformat(row["start_date"]).date()
+                end = datetime.fromisoformat(row["end_date"]).date()
+                current = start
+                while current <= end:
+                    ooo_dates.add(current)
+                    current += timedelta(days=1)
+    except Exception:
+        # Table doesn't exist yet - migration not run
+        pass
     return ooo_dates
 
 
