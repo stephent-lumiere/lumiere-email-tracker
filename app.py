@@ -147,26 +147,28 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
             "replied_at", end_date.isoformat() + "T23:59:59"
         ).limit(10000).execute()
 
-        # Fetch excluded pairs to filter them out
-        excluded_result = supabase.table("excluded_response_pairs").select(
-            "thread_id, replied_at"
-        ).execute()
-
-        excluded_keys = set()
-        if excluded_result.data:
-            for ep in excluded_result.data:
-                excluded_keys.add((ep["thread_id"], ep["replied_at"]))
-
         if pairs_result.data:
             pairs_df = pd.DataFrame(pairs_result.data)
 
-            # Filter out excluded pairs
-            if excluded_keys:
-                pairs_df = pairs_df[
-                    ~pairs_df.apply(lambda r: (r["thread_id"], r["replied_at"]) in excluded_keys, axis=1)
-                ]
+            # Try to filter out excluded pairs (table may not exist yet)
+            try:
+                excluded_result = supabase.table("excluded_response_pairs").select(
+                    "thread_id, replied_at"
+                ).execute()
+                if excluded_result.data:
+                    excluded_keys = {
+                        (ep["thread_id"], ep["replied_at"]) for ep in excluded_result.data
+                    }
+                    pairs_df = pairs_df[
+                        ~pairs_df.apply(
+                            lambda r: (r["thread_id"], r["replied_at"]) in excluded_keys, axis=1
+                        )
+                    ]
+            except Exception:
+                pass  # Table doesn't exist yet, no exclusions to apply
 
             pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
+            pairs_df = pairs_df.dropna(subset=[hours_col])
 
             # Compute both average and median per user from raw pairs
             user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
