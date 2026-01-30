@@ -737,8 +737,18 @@ with tab_manage:
     st.caption("Mark dates when a user is unavailable")
 
     try:
+        import time as time_module
         supabase_ooo = get_supabase()
-        ooo_users = supabase_ooo.table("tracked_users").select("email, display_name").eq("is_active", True).order("email").execute()
+        # Retry logic for transient errors
+        for attempt in range(3):
+            try:
+                ooo_users = supabase_ooo.table("tracked_users").select("email, display_name").eq("is_active", True).order("email").execute()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time_module.sleep(1)
+                    continue
+                raise e
 
         if ooo_users.data:
             ooo_options = {
