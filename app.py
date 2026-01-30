@@ -462,33 +462,12 @@ with tab_manage:
         st.subheader("Add New User")
         new_email = st.text_input("Email Address", placeholder="user@lumiere.education")
         new_name = st.text_input("Display Name (optional)", placeholder="John Smith")
-
-        # Get existing teams from database
-        try:
-            supabase_teams = get_supabase()
-            teams_result = supabase_teams.table("tracked_users").select("team_function").execute()
-            existing_teams = sorted(set(
-                u.get("team_function") for u in (teams_result.data or [])
-                if u.get("team_function")
-            ))
-        except:
-            existing_teams = []
-        default_teams = ["Lumiere Operations", "Ladder Operations", "YFL Operations", "Horizon Operations", "Growth", "Other"]
-        all_teams_add = sorted(set(existing_teams + default_teams))
-        team_options_add = all_teams_add + ["+ Add new team..."]
-
-        selected_team_add = st.selectbox(
+        team_function = st.selectbox(
             "Team Function",
-            options=team_options_add,
+            options=["operations", "growth", "other"],
             index=0,
-            help="Select the team this user belongs to",
-            key="add_team_select"
+            help="Select the team this user belongs to"
         )
-
-        if selected_team_add == "+ Add new team...":
-            team_function = st.text_input("Enter new team name", key="add_new_team_name")
-        else:
-            team_function = selected_team_add
 
         st.markdown("**Working Hours**")
         work_col1, work_col2 = st.columns(2)
@@ -629,17 +608,7 @@ with tab_manage:
         supabase_edit = get_supabase()
         edit_users = supabase_edit.table("tracked_users").select("email, display_name, team_function").eq("is_active", True).order("email").execute()
         if edit_users.data:
-            # Get existing unique teams from database
-            existing_teams = sorted(set(
-                u.get("team_function") for u in edit_users.data
-                if u.get("team_function")
-            ))
-            # Add default teams if not already present
-            default_teams = ["Lumiere Operations", "Ladder Operations", "YFL Operations", "Horizon Operations", "Growth", "Other"]
-            all_teams = sorted(set(existing_teams + default_teams))
-            team_options = all_teams + ["+ Add new team..."]
-
-            edit_col1, edit_col2 = st.columns([2, 2])
+            edit_col1, edit_col2, edit_col3 = st.columns([2, 2, 1])
             edit_options = {
                 (u.get("display_name") or u["email"].split("@")[0]) + f" ({u['email']})": u["email"]
                 for u in edit_users.data
@@ -647,26 +616,18 @@ with tab_manage:
             with edit_col1:
                 selected_label = st.selectbox("Select user", list(edit_options.keys()), key="edit_team_user")
             with edit_col2:
-                selected_team_option = st.selectbox(
+                new_team = st.selectbox(
                     "New team",
-                    options=team_options,
+                    options=["operations", "growth", "other"],
                     key="edit_team_value"
                 )
-
-            # Show text input if adding new team
-            if selected_team_option == "+ Add new team...":
-                new_team = st.text_input("Enter new team name", key="new_team_name")
-            else:
-                new_team = selected_team_option
-
-            if st.button("Update Team", use_container_width=True, key="edit_team_btn"):
-                if new_team and new_team != "+ Add new team...":
+            with edit_col3:
+                st.write("")  # spacing
+                if st.button("Update Team", use_container_width=True, key="edit_team_btn"):
                     selected_email = edit_options[selected_label]
                     supabase_edit.table("tracked_users").update({"team_function": new_team}).eq("email", selected_email).execute()
                     st.success(f"Updated team for {selected_email} to {new_team}")
                     st.cache_resource.clear()
-                else:
-                    st.warning("Please enter a team name")
         else:
             st.write("No active users to edit.")
     except Exception as e:
