@@ -138,17 +138,28 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
     # (daily_stats aggregation loses accuracy due to equal-weight-per-day averaging)
     hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
     try:
-        # Fetch all response pairs (override default 1000 row limit)
-        pairs_result = supabase.table("response_pairs").select(
-            "user_email, thread_id, replied_at, " + hours_col
-        ).gte(
-            "replied_at", start_date.isoformat()
-        ).lte(
-            "replied_at", end_date.isoformat() + "T23:59:59"
-        ).limit(10000).execute()
+        # Fetch ALL response pairs using pagination (Supabase caps at 1000 per request)
+        all_pairs_data = []
+        batch_size = 1000
+        offset = 0
+        while True:
+            pairs_batch = supabase.table("response_pairs").select(
+                "user_email, thread_id, replied_at, " + hours_col
+            ).gte(
+                "replied_at", start_date.isoformat()
+            ).lte(
+                "replied_at", end_date.isoformat() + "T23:59:59"
+            ).range(offset, offset + batch_size - 1).execute()
 
-        if pairs_result.data:
-            pairs_df = pd.DataFrame(pairs_result.data)
+            if not pairs_batch.data:
+                break
+            all_pairs_data.extend(pairs_batch.data)
+            if len(pairs_batch.data) < batch_size:
+                break  # Last page
+            offset += batch_size
+
+        if all_pairs_data:
+            pairs_df = pd.DataFrame(all_pairs_data)
 
             # Try to filter out excluded pairs (table may not exist yet)
             try:
