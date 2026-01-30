@@ -733,29 +733,37 @@ def main():
 
     total_received_emails = 0
 
+    failed_users = []
+
     for user_email in users:
-        result = fetch_user_responses(user_email, max_threads=max_threads)
-        pairs = result["pairs"]
-        received = result["received"]
-        sent = result["sent"]
-        received_emails = result["received_emails"]
+        try:
+            result = fetch_user_responses(user_email, max_threads=max_threads)
+            pairs = result["pairs"]
+            received = result["received"]
+            sent = result["sent"]
+            received_emails = result["received_emails"]
 
-        if pairs:
-            print(f"  Saving response pairs to Supabase...")
-            new_count = save_to_supabase(pairs)
-            print(f"  Saved {new_count} new response pair records")
-            total_pairs += len(pairs)
-            total_new += new_count
+            if pairs:
+                print(f"  Saving response pairs to Supabase...")
+                new_count = save_to_supabase(pairs)
+                print(f"  Saved {new_count} new response pair records")
+                total_pairs += len(pairs)
+                total_new += new_count
 
-        if received_emails:
-            print(f"  Saving received emails to Supabase...")
-            re_count = save_received_emails(received_emails)
-            print(f"  Saved {re_count} received email records")
-            total_received_emails += len(received_emails)
+            if received_emails:
+                print(f"  Saving received emails to Supabase...")
+                re_count = save_received_emails(received_emails)
+                print(f"  Saved {re_count} received email records")
+                total_received_emails += len(received_emails)
 
-        if pairs or received or sent:
-            print(f"  Updating daily stats...")
-            update_daily_stats(user_email, pairs, received, sent)
+            if pairs or received or sent:
+                print(f"  Updating daily stats...")
+                update_daily_stats(user_email, pairs, received, sent)
+
+        except Exception as e:
+            print(f"\n  ERROR processing {user_email}: {e}")
+            print(f"  Skipping this user and continuing with others...")
+            failed_users.append(user_email)
 
     print(f"\n{'='*60}")
     print(f"COMPLETE")
@@ -763,7 +771,14 @@ def main():
     print(f"Total response pairs processed: {total_pairs}")
     print(f"New response pair records saved: {total_new}")
     print(f"Total received emails processed: {total_received_emails}")
+    if failed_users:
+        print(f"Failed users ({len(failed_users)}): {', '.join(failed_users)}")
     print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Exit with error if ALL users failed, but succeed if at least some data was saved
+    if failed_users and len(failed_users) == len(users):
+        print("\nERROR: All users failed. Exiting with error.")
+        exit(1)
 
 
 if __name__ == "__main__":
