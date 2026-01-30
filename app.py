@@ -479,7 +479,7 @@ with tab_manage:
         timezone_options = [
             "America/New_York", "America/Chicago", "America/Denver",
             "America/Los_Angeles", "America/Phoenix", "Europe/London",
-            "Europe/Paris", "Asia/Tokyo", "Asia/Shanghai", "UTC"
+            "Europe/Paris", "Asia/Kolkata", "Asia/Tokyo", "Asia/Shanghai", "UTC"
         ]
         user_timezone = st.selectbox("Timezone", options=timezone_options, index=0, key="add_timezone")
         exclude_weekends = st.checkbox("Exclude weekends from adjusted time", value=True, key="add_exclude_weekends")
