@@ -379,7 +379,7 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
         gmail = get_gmail_service(user_email)
     except Exception as e:
         print(f"  Error authenticating: {e}")
-        return []
+        return {"pairs": [], "received": [], "sent": []}
 
     # Fetch thread IDs
     print(f"  Fetching thread IDs...")
@@ -408,7 +408,7 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     print(f"  Found {len(all_threads)} threads")
 
     if not all_threads:
-        return []
+        return {"pairs": [], "received": [], "sent": []}
 
     # Fetch thread details in parallel
     print(f"  Fetching thread details ({MAX_WORKERS} workers)...")
