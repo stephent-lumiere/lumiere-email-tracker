@@ -185,9 +185,9 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         "team_function": "Team",
     })
 
-    # Round numeric columns
-    aggregated["Avg Response (hrs)"] = aggregated["Avg Response (hrs)"].round(1)
-    aggregated["Median Response (hrs)"] = aggregated["Median Response (hrs)"].round(1)
+    # Round numeric columns (convert to numeric first to handle nulls)
+    aggregated["Avg Response (hrs)"] = pd.to_numeric(aggregated["Avg Response (hrs)"], errors='coerce').round(1)
+    aggregated["Median Response (hrs)"] = pd.to_numeric(aggregated["Median Response (hrs)"], errors='coerce').round(1)
 
     # Reorder columns
     column_order = ["Name", "Email", "Domain", "Team", "Median Response (hrs)", "Avg Response (hrs)", "Responses Tracked", "Emails Received", "Emails Sent"]
