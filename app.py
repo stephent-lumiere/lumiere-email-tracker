@@ -93,14 +93,23 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
     """
     Fetch aggregated stats from Supabase daily_stats table.
     """
-    supabase = get_supabase()
+    import time
 
-    # Query daily_stats for the date range
-    result = supabase.table("daily_stats").select("*").gte(
-        "date", start_date.isoformat()
-    ).lte(
-        "date", end_date.isoformat()
-    ).execute()
+    # Retry logic for transient network errors
+    for attempt in range(3):
+        try:
+            supabase = get_supabase()
+            result = supabase.table("daily_stats").select("*").gte(
+                "date", start_date.isoformat()
+            ).lte(
+                "date", end_date.isoformat()
+            ).execute()
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            raise e
 
     if not result.data:
         return pd.DataFrame()
