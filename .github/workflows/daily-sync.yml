@@ -2,10 +2,8 @@ name: Daily Email Tracker Sync
 
 on:
   schedule:
-    # Runs at 6 AM UTC (10 PM PST, 1 AM EST)
+    # Runs daily at 1 AM EST (6 AM UTC)
     - cron: '0 6 * * *'
-    # Runs at 6 PM UTC (10 AM PST, 1 PM EST) as backup
-    - cron: '0 18 * * *'
   workflow_dispatch:
     inputs:
       user_email:

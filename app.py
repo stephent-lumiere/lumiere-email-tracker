@@ -954,6 +954,53 @@ with tab_dashboard:
         else:
             st.info("No response pairs found for this user in this time period.")
 
+    # Recent Emails Received section - shows for individual or all
+    if selected_individual != "All Individuals":
+        st.divider()
+
+        col_recv_header, col_recv_limit = st.columns([3, 1])
+        with col_recv_header:
+            st.subheader("Recent Emails Received")
+            st.caption(f"External emails received by {selected_individual}")
+        with col_recv_limit:
+            num_received = st.selectbox(
+                "Show",
+                options=[10, 25, 50, 100],
+                index=1,
+                key="num_received_selector"
+            )
+
+        # Show reply rate stats
+        recv_stats = get_received_emails_stats(selected_individual, start_date, end_date)
+        if recv_stats["total"] > 0:
+            stat_col1, stat_col2, stat_col3 = st.columns(3)
+            with stat_col1:
+                st.metric("External Emails Received", recv_stats["total"])
+            with stat_col2:
+                st.metric("Replied To", recv_stats["replied"])
+            with stat_col3:
+                st.metric("Reply Rate", f"{recv_stats['rate']:.0f}%")
+
+        received_df = get_received_emails(selected_individual, start_date, end_date, limit=num_received)
+
+        if not received_df.empty:
+            display_received = received_df[['sender_email', 'subject', 'received_at', 'replied', 'response_time']].copy()
+            display_received.columns = ['From', 'Subject', 'Received', 'Replied', 'Response Time']
+            st.dataframe(
+                display_received,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "From": st.column_config.TextColumn("From", width="medium"),
+                    "Subject": st.column_config.TextColumn("Subject", width="large"),
+                    "Received": st.column_config.TextColumn("Received", width="small"),
+                    "Replied": st.column_config.TextColumn("Replied", width="small"),
+                    "Response Time": st.column_config.TextColumn("Response Time", width="small"),
+                }
+            )
+        else:
+            st.info("No received email data yet. Data will appear after the next sync.")
+
     # Understanding metrics at the bottom
     st.divider()
     with st.expander("📊 Understanding the Metrics"):
