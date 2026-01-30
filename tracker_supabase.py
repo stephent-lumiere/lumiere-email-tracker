@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import base64
 import os
 import threading
 import warnings
@@ -245,8 +246,7 @@ def fetch_thread(user_email: str, thread_id: str) -> Optional[dict]:
         try:
             service = get_thread_local_service(user_email)
             return service.users().threads().get(
-                userId="me", id=thread_id, format="metadata",
-                metadataHeaders=["From", "Subject", "Date"]
+                userId="me", id=thread_id, format="full"
             ).execute()
         except HttpError as e:
             if e.resp.status == 429:
@@ -256,6 +256,53 @@ def fetch_thread(user_email: str, thread_id: str) -> Optional[dict]:
         except Exception:
             return None
     return None
+
+
+def extract_body_preview(message: dict, max_chars: int = 1000) -> str:
+    """Extract plain text body from a Gmail message, truncated to max_chars."""
+    # Try snippet as fast fallback
+    snippet = message.get("snippet", "")
+
+    payload = message.get("payload", {})
+    if not payload:
+        return snippet
+
+    def decode_body(data: str) -> str:
+        try:
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    def find_text_in_parts(parts: list) -> str:
+        for part in parts:
+            mime = part.get("mimeType", "")
+            if mime == "text/plain":
+                data = part.get("body", {}).get("data")
+                if data:
+                    return decode_body(data)
+            # Recurse into nested parts (multipart/alternative, etc.)
+            if part.get("parts"):
+                text = find_text_in_parts(part["parts"])
+                if text:
+                    return text
+        return ""
+
+    # Case 1: Simple message with body directly on payload
+    body_data = payload.get("body", {}).get("data")
+    if body_data and payload.get("mimeType", "").startswith("text/"):
+        text = decode_body(body_data)
+        if text:
+            return text[:max_chars]
+
+    # Case 2: Multipart message - find text/plain part
+    parts = payload.get("parts", [])
+    if parts:
+        text = find_text_in_parts(parts)
+        if text:
+            return text[:max_chars]
+
+    # Fallback to snippet
+    return snippet[:max_chars]
 
 
 def process_thread(thread_data: dict, user_email: str, work_settings: dict = None, ooo_dates: set = None) -> dict:
@@ -286,7 +333,7 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                 date = date.replace(tzinfo=timezone.utc)
         except:
             continue
-        parsed.append({"email": email, "date": date})
+        parsed.append({"email": email, "date": date, "raw_msg": m})
 
     parsed.sort(key=lambda x: x["date"])
 
@@ -303,6 +350,7 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
         elif not is_noise and not is_internal_email(m["email"]):
             result["received"].append(date_str)
             # Build a received_email record (replied info backfilled after pairs loop)
+            body_preview = extract_body_preview(m.get("raw_msg", {}))
             result["received_emails"].append({
                 "user_email": user_email,
                 "sender_email": m["email"][:200],
@@ -312,6 +360,7 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                 "replied": False,
                 "replied_at": None,
                 "response_hours": None,
+                "body_preview": body_preview,
             })
 
     # Find ALL external→user pairs (need at least 2 messages)

@@ -127,20 +127,49 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         if median_col not in df.columns:
             df[median_col] = df.get("median_response_hours", 0)
 
-    # Aggregate by user
+    # Aggregate email counts by user (these sums are correct)
     aggregated = df.groupby("user_email").agg({
         "emails_received": "sum",
         "emails_sent": "sum",
         "response_pairs_count": "sum",
-        avg_col: "mean",
-        median_col: "mean",
     }).reset_index()
 
-    # Rename to standard column names for downstream processing
-    aggregated = aggregated.rename(columns={
-        avg_col: "avg_response_hours",
-        median_col: "median_response_hours",
-    })
+    # Compute correct weighted average from daily stats
+    # (weight each day's average by its response_pairs_count)
+    def compute_weighted_avg(group):
+        weights = group["response_pairs_count"]
+        values = group[avg_col]
+        mask = (weights > 0) & values.notna()
+        if mask.any():
+            return (values[mask] * weights[mask]).sum() / weights[mask].sum()
+        return None
+
+    weighted_avgs = df.groupby("user_email").apply(compute_weighted_avg).reset_index()
+    weighted_avgs.columns = ["user_email", "avg_response_hours"]
+    aggregated = aggregated.merge(weighted_avgs, on="user_email", how="left")
+
+    # Compute true median from response_pairs table (not mean of daily medians)
+    hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
+    try:
+        pairs_result = supabase.table("response_pairs").select(
+            "user_email, " + hours_col
+        ).gte(
+            "replied_at", start_date.isoformat()
+        ).lte(
+            "replied_at", end_date.isoformat() + "T23:59:59"
+        ).execute()
+
+        if pairs_result.data:
+            pairs_df = pd.DataFrame(pairs_result.data)
+            pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
+            true_medians = pairs_df.groupby("user_email")[hours_col].median().reset_index()
+            true_medians.columns = ["user_email", "median_response_hours"]
+            aggregated = aggregated.merge(true_medians, on="user_email", how="left")
+        else:
+            aggregated["median_response_hours"] = None
+    except Exception:
+        # Fallback: use weighted average as a proxy for median
+        aggregated["median_response_hours"] = aggregated["avg_response_hours"]
 
     # Fetch user info (domain, display_name, team_function) from tracked_users
     users_result = supabase.table("tracked_users").select("email, domain, display_name, team_function").execute()
@@ -225,7 +254,7 @@ def get_received_emails(user_email: str, start_date: date, end_date: date, limit
     supabase = get_supabase()
 
     result = supabase.table("received_emails").select(
-        "sender_email, subject, received_at, replied, replied_at, response_hours"
+        "sender_email, subject, received_at, replied, replied_at, response_hours, body_preview"
     ).eq(
         "user_email", user_email
     ).gte(
@@ -266,6 +295,11 @@ def get_received_emails(user_email: str, start_date: date, end_date: date, limit
     # Truncate long fields
     df['sender_email'] = df['sender_email'].str[:35]
     df['subject'] = df['subject'].str[:40]
+
+    # Handle body_preview
+    if 'body_preview' not in df.columns:
+        df['body_preview'] = ""
+    df['body_preview'] = df['body_preview'].fillna("").str[:300]
 
     return df
 
@@ -970,6 +1004,8 @@ with tab_dashboard:
                 key="num_received_selector"
             )
 
+        st.caption("Excludes: internal emails (same domain), automated messages (newsletters, notifications, noreply, calendar alerts, Stripe, etc.)")
+
         # Show reply rate stats
         recv_stats = get_received_emails_stats(selected_individual, start_date, end_date)
         if recv_stats["total"] > 0:
@@ -984,18 +1020,19 @@ with tab_dashboard:
         received_df = get_received_emails(selected_individual, start_date, end_date, limit=num_received)
 
         if not received_df.empty:
-            display_received = received_df[['sender_email', 'subject', 'received_at', 'replied', 'response_time']].copy()
-            display_received.columns = ['From', 'Subject', 'Received', 'Replied', 'Response Time']
+            display_received = received_df[['sender_email', 'subject', 'received_at', 'replied', 'response_time', 'body_preview']].copy()
+            display_received.columns = ['From', 'Subject', 'Received', 'Replied', 'Response Time', 'Email Preview']
             st.dataframe(
                 display_received,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "From": st.column_config.TextColumn("From", width="medium"),
-                    "Subject": st.column_config.TextColumn("Subject", width="large"),
+                    "Subject": st.column_config.TextColumn("Subject", width="medium"),
                     "Received": st.column_config.TextColumn("Received", width="small"),
                     "Replied": st.column_config.TextColumn("Replied", width="small"),
                     "Response Time": st.column_config.TextColumn("Response Time", width="small"),
+                    "Email Preview": st.column_config.TextColumn("Email Preview", width="large"),
                 }
             )
         else:
