@@ -477,7 +477,22 @@ def save_to_supabase(pairs: list) -> int:
             ).execute()
             new_count += len(result.data) if result.data else 0
         except Exception as e:
-            print(f"  Error inserting batch: {e}")
+            # If adjusted_response_hours column doesn't exist, retry without it
+            if "adjusted_response_hours" in str(e):
+                batch_without_adjusted = [
+                    {k: v for k, v in p.items() if k != "adjusted_response_hours"}
+                    for p in batch
+                ]
+                try:
+                    result = supabase.table("response_pairs").upsert(
+                        batch_without_adjusted,
+                        on_conflict="thread_id,replied_at"
+                    ).execute()
+                    new_count += len(result.data) if result.data else 0
+                except Exception as e2:
+                    print(f"  Error inserting batch: {e2}")
+            else:
+                print(f"  Error inserting batch: {e}")
 
     return new_count
 
@@ -578,7 +593,19 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
                 on_conflict="user_email,date"
             ).execute()
         except Exception as e:
-            print(f"  Error updating daily stats: {e}")
+            # If adjusted columns don't exist, retry without them
+            if "avg_adjusted_hours" in str(e) or "median_adjusted_hours" in str(e):
+                stats.pop("avg_adjusted_hours", None)
+                stats.pop("median_adjusted_hours", None)
+                try:
+                    supabase.table("daily_stats").upsert(
+                        stats,
+                        on_conflict="user_email,date"
+                    ).execute()
+                except Exception as e2:
+                    print(f"  Error updating daily stats: {e2}")
+            else:
+                print(f"  Error updating daily stats: {e}")
 
 
 def get_tracked_users() -> list:
