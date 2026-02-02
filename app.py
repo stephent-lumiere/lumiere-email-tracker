@@ -265,6 +265,99 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
     return aggregated
 
 
+def get_response_time_distribution(start_date: date, end_date: date, use_adjusted: bool = False, exclude_long_responses: bool = True) -> pd.DataFrame:
+    """
+    Fetch response time distribution showing % of replies under various thresholds.
+    Returns a DataFrame with rows for each user plus an 'Overall' row.
+    """
+    import time
+
+    supabase = get_supabase()
+    hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
+
+    # Fetch response pairs with pagination
+    all_pairs = []
+    batch_size = 1000
+    offset = 0
+
+    for attempt in range(3):
+        try:
+            while True:
+                batch = supabase.table("response_pairs").select(
+                    f"user_email, {hours_col}"
+                ).gte(
+                    "replied_at", start_date.isoformat()
+                ).lte(
+                    "replied_at", end_date.isoformat() + "T23:59:59"
+                ).range(offset, offset + batch_size - 1).execute()
+
+                if not batch.data:
+                    break
+                all_pairs.extend(batch.data)
+                if len(batch.data) < batch_size:
+                    break
+                offset += batch_size
+            break
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            return pd.DataFrame()
+
+    if not all_pairs:
+        return pd.DataFrame()
+
+    pairs_df = pd.DataFrame(all_pairs)
+    pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
+    pairs_df = pairs_df.dropna(subset=[hours_col])
+
+    # Filter out responses > 7 days if enabled
+    if exclude_long_responses:
+        pairs_df = pairs_df[pairs_df[hours_col] <= 168]
+
+    if pairs_df.empty:
+        return pd.DataFrame()
+
+    # Get user display names
+    users_result = supabase.table("tracked_users").select("email, display_name").execute()
+    user_names = {}
+    if users_result.data:
+        user_names = {u["email"]: u.get("display_name") or u["email"].split("@")[0] for u in users_result.data}
+
+    # Calculate distribution for each user
+    thresholds = [6, 12, 24, 48]
+    results = []
+
+    for user_email, group in pairs_df.groupby("user_email"):
+        total = len(group)
+        if total == 0:
+            continue
+        row = {
+            "Name": user_names.get(user_email, user_email.split("@")[0]),
+            "Email": user_email,
+            "Total Responses": total,
+        }
+        for t in thresholds:
+            count = (group[hours_col] <= t).sum()
+            row[f"< {t}h"] = round(count / total * 100, 1)
+        results.append(row)
+
+    # Calculate overall
+    total_all = len(pairs_df)
+    if total_all > 0:
+        overall_row = {
+            "Name": "Overall",
+            "Email": "",
+            "Total Responses": total_all,
+        }
+        for t in thresholds:
+            count = (pairs_df[hours_col] <= t).sum()
+            overall_row[f"< {t}h"] = round(count / total_all * 100, 1)
+        results.insert(0, overall_row)
+
+    return pd.DataFrame(results)
+
+
 def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.DataFrame:
     """
     Fetch daily trend data for a specific user.
@@ -1040,6 +1133,45 @@ with tab_dashboard:
             "Emails Sent": st.column_config.NumberColumn("Sent", format="%d"),
         }
     )
+
+    # Response Time Distribution
+    st.divider()
+    st.subheader("Response Time Distribution")
+    st.caption("Percentage of replies within each time threshold")
+
+    dist_df = get_response_time_distribution(start_date, end_date, use_adjusted=use_adjusted, exclude_long_responses=exclude_long_responses)
+
+    if not dist_df.empty:
+        # Filter to match selected filters
+        if selected_individual != "All Individuals":
+            # Show just that individual and overall
+            dist_filtered = dist_df[(dist_df["Email"] == selected_individual) | (dist_df["Name"] == "Overall")]
+        else:
+            # Filter by domain/team based on emails in df_filtered
+            filtered_emails = set(df_filtered["Email"].tolist())
+            dist_filtered = dist_df[(dist_df["Email"].isin(filtered_emails)) | (dist_df["Name"] == "Overall")]
+
+        if not dist_filtered.empty:
+            # Sort so Overall is first, then by name
+            dist_filtered = dist_filtered.sort_values("Name", key=lambda x: x.apply(lambda v: "" if v == "Overall" else v))
+
+            st.dataframe(
+                dist_filtered[["Name", "Total Responses", "< 6h", "< 12h", "< 24h", "< 48h"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Name": st.column_config.TextColumn("Name", width="medium"),
+                    "Total Responses": st.column_config.NumberColumn("Responses", format="%d"),
+                    "< 6h": st.column_config.NumberColumn("< 6h", format="%.1f%%"),
+                    "< 12h": st.column_config.NumberColumn("< 12h", format="%.1f%%"),
+                    "< 24h": st.column_config.NumberColumn("< 24h", format="%.1f%%"),
+                    "< 48h": st.column_config.NumberColumn("< 48h", format="%.1f%%"),
+                }
+            )
+        else:
+            st.info("No response data available for the selected filters.")
+    else:
+        st.info("No response data available for the selected date range.")
 
     # Chart - only show if more than 1 person
     if len(df_filtered) > 1:
