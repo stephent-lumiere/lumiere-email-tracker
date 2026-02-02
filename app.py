@@ -499,11 +499,26 @@ with st.sidebar:
 
     days = (end_date - start_date).days
 
-    st.info(f"""
-    **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')})
+    if use_adjusted:
+        st.info(f"""
+        **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}) — **Working Hours Adjusted**
 
-    This shows email threads between **external senders** and the tracked user. Internal emails (same domain, e.g. @lumiere.education) are excluded, as are automated messages (newsletters, notifications, etc.).
-    """)
+        Response times only count hours during each user's configured working hours (e.g., 9 AM - 5 PM in their timezone). Time outside working hours, weekends (if excluded), and out-of-office days are not counted toward response time.
+
+        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~2 hours (1 hr Friday + 1 hr Monday) instead of ~66 hours.*
+
+        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.
+        """)
+    else:
+        st.info(f"""
+        **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}) — **Raw Time**
+
+        Response times are calculated as total elapsed time between receiving an email and sending a reply, including nights, weekends, and holidays.
+
+        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~66 hours.*
+
+        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.
+        """)
 
     st.divider()
 
