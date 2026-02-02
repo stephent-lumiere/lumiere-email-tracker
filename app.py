@@ -445,19 +445,23 @@ with st.sidebar:
     time_window = st.selectbox(
         "Time Window",
         options=[
+            'Yesterday',
             'Last 7 Days (Week)',
             'Last 14 Days (Sprint)',
             'Last 30 Days (Month)',
             'Last 90 Days (Quarter)',
             'Custom Range'
         ],
-        index=1  # Default to Last 14 Days
+        index=2  # Default to Last 14 Days
     )
 
     # Calculate start_date and end_date based on selection
     today = date.today()
 
-    if time_window == 'Last 7 Days (Week)':
+    if time_window == 'Yesterday':
+        start_date = today - timedelta(days=1)
+        end_date = today - timedelta(days=1)
+    elif time_window == 'Last 7 Days (Week)':
         start_date = today - timedelta(days=7)
         end_date = today
     elif time_window == 'Last 14 Days (Sprint)':
