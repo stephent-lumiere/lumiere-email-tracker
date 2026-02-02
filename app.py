@@ -733,7 +733,7 @@ with tab_manage:
             timezone_options = [
                 "America/New_York", "America/Chicago", "America/Denver",
                 "America/Los_Angeles", "America/Phoenix", "Europe/London",
-                "Europe/Paris", "Asia/Tokyo", "Asia/Shanghai", "UTC"
+                "Europe/Paris", "Asia/Kolkata", "Asia/Tokyo", "Asia/Shanghai", "UTC"
             ]
             current_tz = selected_hours_user.get("timezone") or "America/New_York"
             current_tz_idx = timezone_options.index(current_tz) if current_tz in timezone_options else 0
@@ -758,6 +758,54 @@ with tab_manage:
             st.write("No active users to edit.")
     except Exception as e:
         st.error(f"Error: {e}")
+
+    st.divider()
+
+    st.subheader("Current Working Hours Settings")
+    st.caption("Overview of working hours configured for all active users")
+
+    try:
+        supabase_view = get_supabase()
+        view_users = supabase_view.table("tracked_users").select(
+            "email, display_name, work_start_time, work_end_time, timezone, exclude_weekends"
+        ).eq("is_active", True).order("email").execute()
+
+        if view_users.data:
+            # Build display data
+            display_data = []
+            for u in view_users.data:
+                name = u.get("display_name") or u["email"].split("@")[0]
+                start = (u.get("work_start_time") or "09:00")[:5]
+                end = (u.get("work_end_time") or "17:00")[:5]
+                tz = u.get("timezone") or "America/New_York"
+                weekends = "No" if u.get("exclude_weekends", True) else "Yes"
+                display_data.append({
+                    "Name": name,
+                    "Email": u["email"],
+                    "Start": start,
+                    "End": end,
+                    "Timezone": tz,
+                    "Include Weekends": weekends,
+                })
+
+            view_df = pd.DataFrame(display_data)
+            st.dataframe(
+                view_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Name": st.column_config.TextColumn("Name", width="medium"),
+                    "Email": st.column_config.TextColumn("Email", width="large"),
+                    "Start": st.column_config.TextColumn("Start", width="small"),
+                    "End": st.column_config.TextColumn("End", width="small"),
+                    "Timezone": st.column_config.TextColumn("Timezone", width="medium"),
+                    "Include Weekends": st.column_config.TextColumn("Weekends", width="small"),
+                }
+            )
+        else:
+            st.write("No active users found.")
+    except Exception as e:
+        st.error(f"Error loading working hours: {e}")
 
     st.divider()
 
