@@ -89,9 +89,10 @@ def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False) -> pd.DataFrame:
+def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False, exclude_long_responses: bool = True) -> pd.DataFrame:
     """
     Fetch aggregated stats from Supabase daily_stats table.
+    If exclude_long_responses is True, filters out response pairs > 168 hours (7 days).
     """
     import time
 
@@ -180,6 +181,10 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
 
             pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
             pairs_df = pairs_df.dropna(subset=[hours_col])
+
+            # Filter out responses > 7 days (168 hours) if enabled
+            if exclude_long_responses:
+                pairs_df = pairs_df[pairs_df[hours_col] <= 168]
 
             # Compute both average and median per user from raw pairs
             user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
@@ -493,11 +498,20 @@ with st.sidebar:
     )
     use_adjusted = response_time_mode == "Working Hours Adjusted"
 
+    # Exclude long responses toggle
+    exclude_long_responses = st.checkbox(
+        "Exclude responses > 7 days",
+        value=True,
+        help="Filter out response pairs where the reply took more than 7 days (168 hours)"
+    )
+
     # Explainer for each time window
     st.divider()
     st.subheader("About This Data")
 
     days = (end_date - start_date).days
+
+    filter_note = " Responses taking longer than 7 days are excluded." if exclude_long_responses else ""
 
     if use_adjusted:
         st.info(f"""
@@ -507,7 +521,7 @@ with st.sidebar:
 
         *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~2 hours (1 hr Friday + 1 hr Monday) instead of ~66 hours.*
 
-        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.
+        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.{filter_note}
         """)
     else:
         st.info(f"""
@@ -517,7 +531,7 @@ with st.sidebar:
 
         *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~66 hours.*
 
-        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.
+        This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.{filter_note}
         """)
 
     st.divider()
@@ -932,7 +946,7 @@ with tab_manage:
 with tab_dashboard:
     # Fetch data with spinner
     with st.spinner("Fetching data from Supabase..."):
-        df = get_stats_from_supabase(start_date, end_date, use_adjusted=use_adjusted)
+        df = get_stats_from_supabase(start_date, end_date, use_adjusted=use_adjusted, exclude_long_responses=exclude_long_responses)
 
     if df.empty:
         st.warning("No data found for the selected date range.")
