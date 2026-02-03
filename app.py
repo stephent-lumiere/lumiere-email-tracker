@@ -7,6 +7,7 @@ import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from supabase import create_client
+from tracker_supabase import exclude_response_pair, restore_response_pair, get_excluded_pairs, recalculate_daily_stats
 
 # Load environment variables
 load_dotenv()
@@ -382,11 +383,12 @@ def get_received_emails_stats(user_email: str, start_date: date, end_date: date)
 def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10) -> pd.DataFrame:
     """
     Fetch the most recent response pairs for a specific user within a date range.
+    Includes thread_id and exclusion status for the exclude/restore UI.
     """
     supabase = get_supabase()
 
     result = supabase.table("response_pairs").select(
-        "external_sender, subject, received_at, replied_at, response_hours, adjusted_response_hours"
+        "thread_id, user_email, external_sender, subject, received_at, replied_at, response_hours, adjusted_response_hours"
     ).eq(
         "user_email", user_email
     ).gte(
@@ -401,6 +403,25 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
         return pd.DataFrame()
 
     df = pd.DataFrame(result.data)
+
+    # Keep raw replied_at for exclusion logic
+    df['raw_replied_at'] = df['replied_at']
+
+    # Fetch excluded pairs and mark status
+    try:
+        excluded = get_excluded_pairs(user_email)
+        excluded_keys = {(ep["thread_id"], ep["replied_at"]) for ep in excluded}
+        # Build a lookup from (thread_id, replied_at) -> excluded row id
+        excluded_id_map = {(ep["thread_id"], ep["replied_at"]): ep["id"] for ep in excluded}
+        df['excluded'] = df.apply(
+            lambda r: (r["thread_id"], r["raw_replied_at"]) in excluded_keys, axis=1
+        )
+        df['excluded_id'] = df.apply(
+            lambda r: excluded_id_map.get((r["thread_id"], r["raw_replied_at"])), axis=1
+        )
+    except Exception:
+        df['excluded'] = False
+        df['excluded_id'] = None
 
     # Format the data for display
     df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
@@ -1057,21 +1078,98 @@ with tab_dashboard:
             st.subheader("Recent Tracked Response Pairs")
             st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}")
         with col_limit:
-            num_pairs = st.selectbox(
+            pairs_option = st.selectbox(
                 "Show",
-                options=[10, 25, 50, 100],
+                options=[10, 25, 50, 100, "All"],
                 index=0,
                 key="num_pairs_selector"
             )
+            num_pairs = 10000 if pairs_option == "All" else pairs_option
 
         recent_pairs = get_recent_response_pairs(selected_individual, start_date, end_date, limit=num_pairs)
 
         if not recent_pairs.empty:
             st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time']].copy()
-            display_pairs.columns = ['External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']
-            display_pairs['Response (hrs)'] = display_pairs['Response (hrs)'].round(1)
-            st.dataframe(display_pairs, use_container_width=True, hide_index=True)
+
+            # Build display dataframe with Select checkbox and Status column
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id']].copy()
+            display_pairs.insert(0, 'Select', False)
+            display_pairs['Status'] = display_pairs['excluded'].apply(lambda x: "Excluded" if x else "Active")
+            display_pairs['Response (hrs)'] = display_pairs['response_hours'].round(1)
+
+            # Rename visible columns
+            display_pairs = display_pairs.rename(columns={
+                'external_sender': 'External Sender',
+                'subject': 'Subject',
+                'received_at': 'Received',
+                'replied_at': 'Replied',
+                'response_time': 'Response Time',
+            })
+
+            edited_df = st.data_editor(
+                display_pairs[['Select', 'Status', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("Select", default=False),
+                    "Status": st.column_config.TextColumn("Status", width="small"),
+                    "External Sender": st.column_config.TextColumn("External Sender", width="medium"),
+                    "Subject": st.column_config.TextColumn("Subject", width="medium"),
+                    "Received": st.column_config.TextColumn("Received", width="small"),
+                    "Replied": st.column_config.TextColumn("Replied", width="small"),
+                    "Response (hrs)": st.column_config.NumberColumn("Response (hrs)", format="%.1f", width="small"),
+                    "Response Time": st.column_config.TextColumn("Response Time", width="small"),
+                },
+                disabled=["Status", "External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
+                key="response_pairs_editor",
+            )
+
+            # Buttons for Exclude / Restore
+            btn_col1, btn_col2, _ = st.columns([1, 1, 3])
+            with btn_col1:
+                exclude_clicked = st.button("Exclude Selected", key="exclude_selected_btn")
+            with btn_col2:
+                restore_clicked = st.button("Restore Selected", key="restore_selected_btn")
+
+            if exclude_clicked:
+                selected_mask = edited_df['Select'] & (edited_df['Status'] == 'Active')
+                selected_indices = edited_df.index[selected_mask].tolist()
+                if not selected_indices:
+                    st.warning("No active pairs selected to exclude.")
+                else:
+                    affected_dates = set()
+                    for idx in selected_indices:
+                        row = display_pairs.iloc[idx]
+                        pair_data = {
+                            "thread_id": row['thread_id'],
+                            "replied_at": row['raw_replied_at'],
+                            "user_email": row['user_email'],
+                            "external_sender": row['External Sender'],
+                            "subject": row['Subject'],
+                        }
+                        exclude_response_pair(pair_data)
+                        # Collect affected dates for recalculation
+                        replied_dt = pd.to_datetime(row['raw_replied_at'])
+                        affected_dates.add(replied_dt.date().isoformat())
+                    recalculate_daily_stats(selected_individual, list(affected_dates))
+                    st.rerun()
+
+            if restore_clicked:
+                selected_mask = edited_df['Select'] & (edited_df['Status'] == 'Excluded')
+                selected_indices = edited_df.index[selected_mask].tolist()
+                if not selected_indices:
+                    st.warning("No excluded pairs selected to restore.")
+                else:
+                    affected_dates = set()
+                    for idx in selected_indices:
+                        row = display_pairs.iloc[idx]
+                        exc_id = row['excluded_id']
+                        if exc_id:
+                            restore_response_pair(str(exc_id))
+                            replied_dt = pd.to_datetime(row['raw_replied_at'])
+                            affected_dates.add(replied_dt.date().isoformat())
+                    recalculate_daily_stats(selected_individual, list(affected_dates))
+                    st.rerun()
         else:
             st.info("No response pairs found for this user in this time period.")
 
