@@ -805,7 +805,7 @@ with tab_manage:
                     "Name": st.column_config.TextColumn("Name", width="medium"),
                     "Email": st.column_config.TextColumn("Email", width="large"),
                     "Timezone": st.column_config.TextColumn("Timezone", width="medium"),
-                    "Include Weekends": st.column_config.TextColumn("Weekends", width="small"),
+                    "Include Weekends": st.column_config.TextColumn("Weekends", width="small", help="Yes = weekends count toward response time. No = weekends are excluded from adjusted response time."),
                 }
             )
         else:
