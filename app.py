@@ -1222,11 +1222,8 @@ with tab_dashboard:
                 axis=1
             )
 
-            # Visually mark excluded rows with a red dot prefix
-            for idx in display_pairs.index:
-                if display_pairs.at[idx, 'is_excluded']:
-                    display_pairs.at[idx, 'external_sender'] = f"\U0001f534 {display_pairs.at[idx, 'external_sender']}"
-                    display_pairs.at[idx, 'subject'] = f"\U0001f534 {display_pairs.at[idx, 'subject']}"
+            # Excluded column: checkmark for excluded pairs
+            display_pairs['Excluded'] = display_pairs['is_excluded']
 
             # Rename visible columns
             display_pairs = display_pairs.rename(columns={
@@ -1238,11 +1235,12 @@ with tab_dashboard:
             })
 
             edited_df = st.data_editor(
-                display_pairs[['Select', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
+                display_pairs[['Select', 'Excluded', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Select": st.column_config.CheckboxColumn("Select", default=False),
+                    "Excluded": st.column_config.CheckboxColumn("Excluded", disabled=True),
                     "External Sender": st.column_config.TextColumn("External Sender", width="medium"),
                     "Subject": st.column_config.TextColumn("Subject", width="medium"),
                     "Received": st.column_config.TextColumn("Received", width="small"),
@@ -1250,7 +1248,7 @@ with tab_dashboard:
                     "Response (hrs)": st.column_config.NumberColumn("Response (hrs)", format="%.1f", width="small"),
                     "Response Time": st.column_config.TextColumn("Response Time", width="small"),
                 },
-                disabled=["External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
+                disabled=["Excluded", "External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
                 key="response_pairs_editor",
             )
 
