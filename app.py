@@ -1222,11 +1222,11 @@ with tab_dashboard:
                 axis=1
             )
 
-            # Tag excluded rows in the External Sender field
+            # Visually mark excluded rows with a red dot prefix
             for idx in display_pairs.index:
                 if display_pairs.at[idx, 'is_excluded']:
-                    reason = "excluded" if display_pairs.at[idx, 'excluded'] else ">7d"
-                    display_pairs.at[idx, 'external_sender'] = f"[{reason}] {display_pairs.at[idx, 'external_sender']}"
+                    display_pairs.at[idx, 'external_sender'] = f"\U0001f534 {display_pairs.at[idx, 'external_sender']}"
+                    display_pairs.at[idx, 'subject'] = f"\U0001f534 {display_pairs.at[idx, 'subject']}"
 
             # Rename visible columns
             display_pairs = display_pairs.rename(columns={
