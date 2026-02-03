@@ -1137,22 +1137,26 @@ with tab_dashboard:
                 if not selected_indices:
                     st.warning("No active pairs selected to exclude.")
                 else:
-                    affected_dates = set()
-                    for idx in selected_indices:
-                        row = display_pairs.iloc[idx]
-                        pair_data = {
-                            "thread_id": row['thread_id'],
-                            "replied_at": row['raw_replied_at'],
-                            "user_email": row['user_email'],
-                            "external_sender": row['External Sender'],
-                            "subject": row['Subject'],
-                        }
-                        exclude_response_pair(pair_data)
-                        # Collect affected dates for recalculation
-                        replied_dt = pd.to_datetime(row['raw_replied_at'])
-                        affected_dates.add(replied_dt.date().isoformat())
-                    recalculate_daily_stats(selected_individual, list(affected_dates))
-                    st.rerun()
+                    try:
+                        affected_dates = set()
+                        for idx in selected_indices:
+                            row = display_pairs.iloc[idx]
+                            pair_data = {
+                                "thread_id": row['thread_id'],
+                                "replied_at": row['raw_replied_at'],
+                                "user_email": row['user_email'],
+                                "external_sender": row['External Sender'],
+                                "subject": row['Subject'],
+                                "response_hours": row['response_hours'],
+                            }
+                            exclude_response_pair(pair_data)
+                            replied_dt = pd.to_datetime(row['raw_replied_at'])
+                            affected_dates.add(replied_dt.date().isoformat())
+                        recalculate_daily_stats(selected_individual, list(affected_dates))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error excluding pairs: {e}")
+                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` table in your Supabase dashboard (Table Editor → excluded_response_pairs → RLS Policies).")
 
             if restore_clicked:
                 selected_mask = edited_df['Select'] & (edited_df['Status'] == 'Excluded')
@@ -1160,16 +1164,20 @@ with tab_dashboard:
                 if not selected_indices:
                     st.warning("No excluded pairs selected to restore.")
                 else:
-                    affected_dates = set()
-                    for idx in selected_indices:
-                        row = display_pairs.iloc[idx]
-                        exc_id = row['excluded_id']
-                        if exc_id:
-                            restore_response_pair(str(exc_id))
-                            replied_dt = pd.to_datetime(row['raw_replied_at'])
-                            affected_dates.add(replied_dt.date().isoformat())
-                    recalculate_daily_stats(selected_individual, list(affected_dates))
-                    st.rerun()
+                    try:
+                        affected_dates = set()
+                        for idx in selected_indices:
+                            row = display_pairs.iloc[idx]
+                            exc_id = row['excluded_id']
+                            if exc_id:
+                                restore_response_pair(str(exc_id))
+                                replied_dt = pd.to_datetime(row['raw_replied_at'])
+                                affected_dates.add(replied_dt.date().isoformat())
+                        recalculate_daily_stats(selected_individual, list(affected_dates))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error restoring pairs: {e}")
+                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` table in your Supabase dashboard (Table Editor → excluded_response_pairs → RLS Policies).")
         else:
             st.info("No response pairs found for this user in this time period.")
 
