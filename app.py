@@ -7,7 +7,99 @@ import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from supabase import create_client
-from tracker_supabase import exclude_response_pair, restore_response_pair, get_excluded_pairs, recalculate_daily_stats, whitelist_response_pair, remove_whitelisted_pair, get_whitelisted_pairs
+
+def exclude_response_pair(pair_data: dict):
+    """Insert a response pair into the excluded_response_pairs table."""
+    supabase = get_supabase()
+    supabase.table("excluded_response_pairs").upsert(
+        pair_data, on_conflict="thread_id,replied_at"
+    ).execute()
+
+def restore_response_pair(excluded_id: str):
+    """Remove a pair from excluded_response_pairs by its id."""
+    supabase = get_supabase()
+    supabase.table("excluded_response_pairs").delete().eq("id", excluded_id).execute()
+
+def get_excluded_pairs(user_email: str = None) -> list:
+    """Fetch excluded pairs, optionally filtered by user."""
+    supabase = get_supabase()
+    query = supabase.table("excluded_response_pairs").select("*")
+    if user_email:
+        query = query.eq("user_email", user_email)
+    result = query.order("excluded_at", desc=True).execute()
+    return result.data if result.data else []
+
+def whitelist_response_pair(pair_data: dict):
+    """Add a response pair to the whitelist (override >7d filter)."""
+    supabase = get_supabase()
+    supabase.table("whitelisted_response_pairs").upsert(
+        pair_data, on_conflict="thread_id,replied_at"
+    ).execute()
+
+def remove_whitelisted_pair(whitelist_id: str):
+    """Remove a pair from the whitelist by its id."""
+    supabase = get_supabase()
+    supabase.table("whitelisted_response_pairs").delete().eq("id", whitelist_id).execute()
+
+def get_whitelisted_pairs(user_email: str = None) -> list:
+    """Fetch whitelisted pairs, optionally filtered by user."""
+    supabase = get_supabase()
+    query = supabase.table("whitelisted_response_pairs").select("*")
+    if user_email:
+        query = query.eq("user_email", user_email)
+    result = query.execute()
+    return result.data if result.data else []
+
+def recalculate_daily_stats(user_email: str, dates: list):
+    """Recalculate daily_stats for specific user+dates after exclusion/restoration."""
+    supabase = get_supabase()
+    for date_str in dates:
+        pairs_result = supabase.table("response_pairs").select(
+            "response_hours, thread_id, replied_at"
+        ).eq("user_email", user_email).gte(
+            "replied_at", date_str + "T00:00:00"
+        ).lte("replied_at", date_str + "T23:59:59").execute()
+
+        excluded_result = supabase.table("excluded_response_pairs").select(
+            "thread_id, replied_at"
+        ).eq("user_email", user_email).execute()
+
+        excluded_keys = set()
+        if excluded_result.data:
+            for ep in excluded_result.data:
+                excluded_keys.add((ep["thread_id"], ep["replied_at"]))
+
+        hours_list = []
+        if pairs_result.data:
+            for p in pairs_result.data:
+                if (p["thread_id"], p["replied_at"]) not in excluded_keys:
+                    hours_list.append(p["response_hours"])
+
+        stats_update = {
+            "response_pairs_count": len(hours_list),
+            "updated_at": datetime.now().isoformat(),
+        }
+
+        if hours_list:
+            sorted_hours = sorted(hours_list)
+            n = len(sorted_hours)
+            median = sorted_hours[n // 2] if n % 2 == 1 else (sorted_hours[n//2 - 1] + sorted_hours[n//2]) / 2
+            stats_update["avg_response_hours"] = round(sum(hours_list) / n, 2)
+            stats_update["median_response_hours"] = round(median, 2)
+            stats_update["min_response_hours"] = round(min(hours_list), 2)
+            stats_update["max_response_hours"] = round(max(hours_list), 2)
+        else:
+            stats_update["avg_response_hours"] = None
+            stats_update["median_response_hours"] = None
+            stats_update["min_response_hours"] = None
+            stats_update["max_response_hours"] = None
+
+        try:
+            supabase.table("daily_stats").update(stats_update).eq(
+                "user_email", user_email
+            ).eq("date", date_str).execute()
+        except Exception as e:
+            print(f"Error updating daily stats for {date_str}: {e}")
 
 # Load environment variables
 load_dotenv()
