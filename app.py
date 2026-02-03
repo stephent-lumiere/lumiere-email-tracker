@@ -7,7 +7,7 @@ import requests
 from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 from supabase import create_client
-from tracker_supabase import exclude_response_pair, restore_response_pair, get_excluded_pairs, recalculate_daily_stats
+from tracker_supabase import exclude_response_pair, restore_response_pair, get_excluded_pairs, recalculate_daily_stats, whitelist_response_pair, remove_whitelisted_pair, get_whitelisted_pairs
 
 # Load environment variables
 load_dotenv()
@@ -183,9 +183,22 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
             pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
             pairs_df = pairs_df.dropna(subset=[hours_col])
 
-            # Filter out responses > 7 days (168 hours) if enabled
+            # Filter out responses > 7 days (168 hours) if enabled, but keep whitelisted pairs
             if exclude_long_responses:
-                pairs_df = pairs_df[pairs_df[hours_col] <= 168]
+                try:
+                    wl_result = supabase.table("whitelisted_response_pairs").select(
+                        "thread_id, replied_at"
+                    ).execute()
+                    if wl_result.data:
+                        wl_keys = {(wp["thread_id"], wp["replied_at"]) for wp in wl_result.data}
+                        pairs_df = pairs_df[
+                            (pairs_df[hours_col] <= 168) |
+                            pairs_df.apply(lambda r: (r["thread_id"], r["replied_at"]) in wl_keys, axis=1)
+                        ]
+                    else:
+                        pairs_df = pairs_df[pairs_df[hours_col] <= 168]
+                except Exception:
+                    pairs_df = pairs_df[pairs_df[hours_col] <= 168]
 
             # Compute both average and median per user from raw pairs
             user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
@@ -422,6 +435,21 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
     except Exception:
         df['excluded'] = False
         df['excluded_id'] = None
+
+    # Fetch whitelisted pairs (overrides for >7d filter)
+    try:
+        whitelisted = get_whitelisted_pairs(user_email)
+        whitelisted_keys = {(wp["thread_id"], wp["replied_at"]) for wp in whitelisted}
+        whitelisted_id_map = {(wp["thread_id"], wp["replied_at"]): wp["id"] for wp in whitelisted}
+        df['whitelisted'] = df.apply(
+            lambda r: (r["thread_id"], r["raw_replied_at"]) in whitelisted_keys, axis=1
+        )
+        df['whitelisted_id'] = df.apply(
+            lambda r: whitelisted_id_map.get((r["thread_id"], r["raw_replied_at"])), axis=1
+        )
+    except Exception:
+        df['whitelisted'] = False
+        df['whitelisted_id'] = None
 
     # Format the data for display
     df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
@@ -1091,11 +1119,22 @@ with tab_dashboard:
         if not recent_pairs.empty:
             st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
 
-            # Build display dataframe with Select checkbox and Status column
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id']].copy()
+            # Build display dataframe with Select checkbox
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id']].copy()
             display_pairs.insert(0, 'Select', False)
-            display_pairs['Status'] = display_pairs['excluded'].apply(lambda x: "Excluded" if x else "Active")
             display_pairs['Response (hrs)'] = display_pairs['response_hours'].round(1)
+
+            # Mark rows as excluded (manual, or >7d unless whitelisted)
+            display_pairs['is_excluded'] = display_pairs.apply(
+                lambda r: r['excluded'] or (exclude_long_responses and r['response_hours'] > 168 and not r['whitelisted']),
+                axis=1
+            )
+
+            # Tag excluded rows in the External Sender field
+            for idx in display_pairs.index:
+                if display_pairs.at[idx, 'is_excluded']:
+                    reason = "excluded" if display_pairs.at[idx, 'excluded'] else ">7d"
+                    display_pairs.at[idx, 'external_sender'] = f"[{reason}] {display_pairs.at[idx, 'external_sender']}"
 
             # Rename visible columns
             display_pairs = display_pairs.rename(columns={
@@ -1107,12 +1146,11 @@ with tab_dashboard:
             })
 
             edited_df = st.data_editor(
-                display_pairs[['Select', 'Status', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
+                display_pairs[['Select', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Select": st.column_config.CheckboxColumn("Select", default=False),
-                    "Status": st.column_config.TextColumn("Status", width="small"),
                     "External Sender": st.column_config.TextColumn("External Sender", width="medium"),
                     "Subject": st.column_config.TextColumn("Subject", width="medium"),
                     "Received": st.column_config.TextColumn("Received", width="small"),
@@ -1120,7 +1158,7 @@ with tab_dashboard:
                     "Response (hrs)": st.column_config.NumberColumn("Response (hrs)", format="%.1f", width="small"),
                     "Response Time": st.column_config.TextColumn("Response Time", width="small"),
                 },
-                disabled=["Status", "External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
+                disabled=["External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
                 key="response_pairs_editor",
             )
 
@@ -1132,8 +1170,9 @@ with tab_dashboard:
                 restore_clicked = st.button("Restore Selected", key="restore_selected_btn")
 
             if exclude_clicked:
-                selected_mask = edited_df['Select'] & (edited_df['Status'] == 'Active')
-                selected_indices = edited_df.index[selected_mask].tolist()
+                selected_indices = edited_df.index[edited_df['Select']].tolist()
+                # Filter to only active (non-excluded) pairs
+                selected_indices = [i for i in selected_indices if not display_pairs.iloc[i]['is_excluded']]
                 if not selected_indices:
                     st.warning("No active pairs selected to exclude.")
                 else:
@@ -1150,17 +1189,21 @@ with tab_dashboard:
                                 "response_hours": row['response_hours'],
                             }
                             exclude_response_pair(pair_data)
+                            # If this pair was whitelisted, remove the whitelist entry too
+                            if row['whitelisted_id']:
+                                remove_whitelisted_pair(str(row['whitelisted_id']))
                             replied_dt = pd.to_datetime(row['raw_replied_at'])
                             affected_dates.add(replied_dt.date().isoformat())
                         recalculate_daily_stats(selected_individual, list(affected_dates))
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error excluding pairs: {e}")
-                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` table in your Supabase dashboard (Table Editor → excluded_response_pairs → RLS Policies).")
+                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` and `whitelisted_response_pairs` tables in Supabase.")
 
             if restore_clicked:
-                selected_mask = edited_df['Select'] & (edited_df['Status'] == 'Excluded')
-                selected_indices = edited_df.index[selected_mask].tolist()
+                selected_indices = edited_df.index[edited_df['Select']].tolist()
+                # Filter to only excluded pairs (manual or >7d)
+                selected_indices = [i for i in selected_indices if display_pairs.iloc[i]['is_excluded']]
                 if not selected_indices:
                     st.warning("No excluded pairs selected to restore.")
                 else:
@@ -1168,16 +1211,25 @@ with tab_dashboard:
                         affected_dates = set()
                         for idx in selected_indices:
                             row = display_pairs.iloc[idx]
-                            exc_id = row['excluded_id']
-                            if exc_id:
-                                restore_response_pair(str(exc_id))
-                                replied_dt = pd.to_datetime(row['raw_replied_at'])
-                                affected_dates.add(replied_dt.date().isoformat())
+                            if row['excluded']:
+                                # Manually excluded — remove from excluded table
+                                exc_id = row['excluded_id']
+                                if exc_id:
+                                    restore_response_pair(str(exc_id))
+                            elif exclude_long_responses and row['response_hours'] > 168:
+                                # Excluded by >7d filter — whitelist it
+                                whitelist_response_pair({
+                                    "thread_id": row['thread_id'],
+                                    "replied_at": row['raw_replied_at'],
+                                    "user_email": row['user_email'],
+                                })
+                            replied_dt = pd.to_datetime(row['raw_replied_at'])
+                            affected_dates.add(replied_dt.date().isoformat())
                         recalculate_daily_stats(selected_individual, list(affected_dates))
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error restoring pairs: {e}")
-                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` table in your Supabase dashboard (Table Editor → excluded_response_pairs → RLS Policies).")
+                        st.info("If this is an RLS error, disable Row Level Security on the `excluded_response_pairs` and `whitelisted_response_pairs` tables in Supabase.")
         else:
             st.info("No response pairs found for this user in this time period.")
 
@@ -1240,4 +1292,13 @@ with tab_dashboard:
         - **Responses Tracked**: The number of external email → user reply pairs found. **This is what response time calculations are based on.** Each time an external person emails and the user replies, that's one tracked response.
         - **Emails Received**: External emails received (excludes internal @lumiere.education emails and automated messages).
         - **Emails Sent**: Emails sent by this user in tracked threads.
+
+        **Excluded Response Pairs**
+
+        Some response pairs are excluded from metric calculations and marked with a tag in the response pairs table:
+
+        - **[excluded]** — Manually excluded via the checkbox selection and "Exclude Selected" button. Use "Restore Selected" to include them again.
+        - **[>7d]** — Automatically excluded because the response took longer than 7 days (168 hours). This filter is controlled by the "Exclude responses > 7 days" checkbox in the sidebar. You can also restore individual >7d pairs using "Restore Selected" — restored pairs will stay included even with the >7d filter on.
+
+        Excluded pairs still appear in the table for visibility but are not counted toward the summary metrics above.
         """)

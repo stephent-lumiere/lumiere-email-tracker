@@ -669,6 +669,31 @@ def get_excluded_pairs(user_email: str = None) -> list:
     return result.data if result.data else []
 
 
+def whitelist_response_pair(pair_data: dict):
+    """Add a response pair to the whitelist (override >7d filter)."""
+    supabase = get_supabase()
+    supabase.table("whitelisted_response_pairs").upsert(
+        pair_data,
+        on_conflict="thread_id,replied_at"
+    ).execute()
+
+
+def remove_whitelisted_pair(whitelist_id: str):
+    """Remove a pair from the whitelist by its id."""
+    supabase = get_supabase()
+    supabase.table("whitelisted_response_pairs").delete().eq("id", whitelist_id).execute()
+
+
+def get_whitelisted_pairs(user_email: str = None) -> list:
+    """Fetch whitelisted pairs, optionally filtered by user."""
+    supabase = get_supabase()
+    query = supabase.table("whitelisted_response_pairs").select("*")
+    if user_email:
+        query = query.eq("user_email", user_email)
+    result = query.execute()
+    return result.data if result.data else []
+
+
 def recalculate_daily_stats(user_email: str, dates: list):
     """Recalculate daily_stats for specific user+dates after exclusion/restoration."""
     from collections import defaultdict
