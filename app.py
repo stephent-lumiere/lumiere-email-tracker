@@ -521,9 +521,9 @@ with st.sidebar:
         st.info(f"""
         **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}) — **Working Hours Adjusted**
 
-        Response times only count hours during each user's configured working hours (e.g., 9 AM - 5 PM in their timezone). Time outside working hours, weekends (if excluded), and out-of-office days are not counted toward response time.
+        Response times only count hours during each user's configured working hours (e.g., 9 AM - 5 PM in their timezone). Time outside working hours, weekends (if excluded), and **out-of-office days are fully excluded** from response time calculations.
 
-        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~2 hours (1 hr Friday + 1 hr Monday) instead of ~66 hours.*
+        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~2 hours (1 hr Friday + 1 hr Monday) instead of ~66 hours. If a user is marked as OOO for an entire week, none of those days count toward their response time.*
 
         This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.{filter_note}
         """)
@@ -531,7 +531,7 @@ with st.sidebar:
         st.info(f"""
         **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}) — **Raw Time**
 
-        Response times are calculated as total elapsed time between receiving an email and sending a reply, including nights, weekends, and holidays.
+        Response times are calculated as total elapsed time between receiving an email and sending a reply, including nights, weekends, holidays, and out-of-office days. OOO time is **not** excluded in this mode — switch to **Working Hours Adjusted** to account for OOO periods.
 
         *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~66 hours.*
 
