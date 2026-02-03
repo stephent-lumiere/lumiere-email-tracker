@@ -498,7 +498,7 @@ with st.sidebar:
         "Response Time Mode",
         options=["Raw Time", "Working Hours Adjusted"],
         index=0,
-        help="Raw shows actual elapsed time. Adjusted only counts time during working hours."
+        help="Raw shows actual elapsed time. Adjusted excludes weekends and out-of-office days."
     )
     use_adjusted = response_time_mode == "Working Hours Adjusted"
 
@@ -521,9 +521,9 @@ with st.sidebar:
         st.info(f"""
         **Data from the last {days} days** ({start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}) — **Working Hours Adjusted**
 
-        Response times only count hours during each user's configured working hours (e.g., 9 AM - 5 PM in their timezone). Time outside working hours, weekends (if excluded), and **out-of-office days are fully excluded** from response time calculations.
+        Response times count full 24-hour days but **exclude weekends** (if configured for the user's timezone) and **out-of-office days**. On the day an email is received, time counts from when it arrived to end of day. On the reply day, time counts from start of day to when the reply was sent.
 
-        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~2 hours (1 hr Friday + 1 hr Monday) instead of ~66 hours. If a user is marked as OOO for an entire week, none of those days count toward their response time.*
+        *Example: An email received Friday at 4 PM with a reply Monday at 10 AM would show ~18 hours (8 hrs Friday + 10 hrs Monday), skipping Saturday and Sunday. If a user is marked as OOO for an entire week, none of those days count toward their response time.*
 
         This shows email threads between **external senders** and the tracked user. Internal emails (same domain) and automated messages are excluded.{filter_note}
         """)
@@ -568,13 +568,6 @@ with tab_manage:
             index=0,
             help="Select the team this user belongs to"
         )
-
-        st.markdown("**Working Hours**")
-        work_col1, work_col2 = st.columns(2)
-        with work_col1:
-            work_start = st.time_input("Start Time", value=datetime.strptime("09:00", "%H:%M").time(), key="add_work_start")
-        with work_col2:
-            work_end = st.time_input("End Time", value=datetime.strptime("17:00", "%H:%M").time(), key="add_work_end")
 
         timezone_options = [
             "America/New_York", "America/Chicago", "America/Denver",
@@ -631,8 +624,6 @@ with tab_manage:
                             "domain": domain,
                             "team_function": team_function,
                             "is_active": True,
-                            "work_start_time": work_start.strftime("%H:%M"),
-                            "work_end_time": work_end.strftime("%H:%M"),
                             "timezone": user_timezone,
                             "exclude_weekends": exclude_weekends,
                         }).execute()
@@ -735,13 +726,13 @@ with tab_manage:
 
     st.divider()
 
-    st.subheader("Edit Working Hours")
-    st.caption("Update working hours and timezone for a user")
+    st.subheader("Edit Timezone & Weekends")
+    st.caption("Update timezone and weekend settings for a user")
 
     try:
         supabase_hours = get_supabase()
         hours_users = supabase_hours.table("tracked_users").select(
-            "email, display_name, work_start_time, work_end_time, timezone, exclude_weekends"
+            "email, display_name, timezone, exclude_weekends"
         ).eq("is_active", True).order("email").execute()
 
         if hours_users.data:
@@ -752,16 +743,6 @@ with tab_manage:
 
             selected_hours_label = st.selectbox("Select user", list(hours_options.keys()), key="hours_user")
             selected_hours_user = hours_options[selected_hours_label]
-
-            hours_col1, hours_col2 = st.columns(2)
-            with hours_col1:
-                start_str = (selected_hours_user.get("work_start_time") or "09:00")[:5]  # Handle HH:MM:SS
-                current_start = datetime.strptime(start_str, "%H:%M").time()
-                new_work_start = st.time_input("Work Start", value=current_start, key="edit_work_start")
-            with hours_col2:
-                end_str = (selected_hours_user.get("work_end_time") or "17:00")[:5]  # Handle HH:MM:SS
-                current_end = datetime.strptime(end_str, "%H:%M").time()
-                new_work_end = st.time_input("Work End", value=current_end, key="edit_work_end")
 
             timezone_options = [
                 "America/New_York", "America/Chicago", "America/Denver",
@@ -778,14 +759,12 @@ with tab_manage:
                 key="edit_exclude_weekends"
             )
 
-            if st.button("Update Working Hours", use_container_width=True, key="update_hours_btn"):
+            if st.button("Update Settings", use_container_width=True, key="update_hours_btn"):
                 supabase_hours.table("tracked_users").update({
-                    "work_start_time": new_work_start.strftime("%H:%M"),
-                    "work_end_time": new_work_end.strftime("%H:%M"),
                     "timezone": new_timezone,
                     "exclude_weekends": new_exclude_weekends,
                 }).eq("email", selected_hours_user["email"]).execute()
-                st.success(f"Updated working hours for {selected_hours_user['email']}")
+                st.success(f"Updated settings for {selected_hours_user['email']}")
                 st.cache_resource.clear()
         else:
             st.write("No active users to edit.")
@@ -794,13 +773,13 @@ with tab_manage:
 
     st.divider()
 
-    st.subheader("Current Working Hours Settings")
-    st.caption("Overview of working hours configured for all active users")
+    st.subheader("Current Timezone & Weekend Settings")
+    st.caption("Overview of timezone and weekend settings for all active users")
 
     try:
         supabase_view = get_supabase()
         view_users = supabase_view.table("tracked_users").select(
-            "email, display_name, work_start_time, work_end_time, timezone, exclude_weekends"
+            "email, display_name, timezone, exclude_weekends"
         ).eq("is_active", True).order("email").execute()
 
         if view_users.data:
@@ -808,15 +787,11 @@ with tab_manage:
             display_data = []
             for u in view_users.data:
                 name = u.get("display_name") or u["email"].split("@")[0]
-                start = (u.get("work_start_time") or "09:00")[:5]
-                end = (u.get("work_end_time") or "17:00")[:5]
                 tz = u.get("timezone") or "America/New_York"
                 weekends = "No" if u.get("exclude_weekends", True) else "Yes"
                 display_data.append({
                     "Name": name,
                     "Email": u["email"],
-                    "Start": start,
-                    "End": end,
                     "Timezone": tz,
                     "Include Weekends": weekends,
                 })
@@ -829,8 +804,6 @@ with tab_manage:
                 column_config={
                     "Name": st.column_config.TextColumn("Name", width="medium"),
                     "Email": st.column_config.TextColumn("Email", width="large"),
-                    "Start": st.column_config.TextColumn("Start", width="small"),
-                    "End": st.column_config.TextColumn("End", width="small"),
                     "Timezone": st.column_config.TextColumn("Timezone", width="medium"),
                     "Include Weekends": st.column_config.TextColumn("Weekends", width="small"),
                 }
@@ -838,7 +811,7 @@ with tab_manage:
         else:
             st.write("No active users found.")
     except Exception as e:
-        st.error(f"Error loading working hours: {e}")
+        st.error(f"Error loading settings: {e}")
 
     st.divider()
 

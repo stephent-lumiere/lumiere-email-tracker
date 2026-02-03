@@ -93,27 +93,18 @@ def is_internal_email(email: str) -> bool:
 def get_user_work_settings(user_email: str) -> dict:
     """Fetch work schedule settings for a user. Returns defaults if columns don't exist."""
     default_settings = {
-        "work_start": dt_time(9, 0),
-        "work_end": dt_time(17, 0),
         "timezone": "America/New_York",
         "exclude_weekends": True,
     }
     try:
         supabase = get_supabase()
         result = supabase.table("tracked_users").select(
-            "work_start_time, work_end_time, timezone, exclude_weekends"
+            "timezone, exclude_weekends"
         ).eq("email", user_email).execute()
 
         if result.data:
             settings = result.data[0]
-            start_str = settings.get("work_start_time") or "09:00"
-            end_str = settings.get("work_end_time") or "17:00"
-            # Handle time strings (could be "09:00" or "09:00:00")
-            start_parts = start_str.split(":")
-            end_parts = end_str.split(":")
             return {
-                "work_start": dt_time(int(start_parts[0]), int(start_parts[1])),
-                "work_end": dt_time(int(end_parts[0]), int(end_parts[1])),
                 "timezone": settings.get("timezone") or "America/New_York",
                 "exclude_weekends": settings.get("exclude_weekends", True),
             }
@@ -149,17 +140,17 @@ def get_user_ooo_dates(user_email: str) -> set:
 def calculate_adjusted_hours(
     received_at: datetime,
     replied_at: datetime,
-    work_start: dt_time,
-    work_end: dt_time,
     user_tz: str,
     exclude_weekends: bool,
     ooo_dates: set
 ) -> float:
     """
-    Calculate working hours between received_at and replied_at.
+    Calculate adjusted hours between received_at and replied_at.
 
-    Only counts time during working hours (work_start to work_end),
-    excludes weekends (if enabled), and excludes OOO dates.
+    Counts full 24-hour days, excluding weekends (if enabled) and OOO dates.
+    On the received day, counts from received time to end of day.
+    On the replied day, counts from start of day to replied time.
+    On full intermediate days, counts 24 hours.
     """
     try:
         tz = ZoneInfo(user_tz)
@@ -170,16 +161,7 @@ def calculate_adjusted_hours(
     received_local = received_at.astimezone(tz)
     replied_local = replied_at.astimezone(tz)
 
-    # Work hours per day in seconds
-    work_start_seconds = work_start.hour * 3600 + work_start.minute * 60
-    work_end_seconds = work_end.hour * 3600 + work_end.minute * 60
-    work_day_seconds = work_end_seconds - work_start_seconds
-
-    if work_day_seconds <= 0:
-        # Invalid work hours config, return raw hours
-        return (replied_at - received_at).total_seconds() / 3600
-
-    total_work_seconds = 0
+    total_seconds = 0
     current_date = received_local.date()
     end_date = replied_local.date()
 
@@ -194,9 +176,9 @@ def calculate_adjusted_hours(
             current_date += timedelta(days=1)
             continue
 
-        # Calculate work seconds for this day
-        day_start = datetime.combine(current_date, work_start, tzinfo=tz)
-        day_end = datetime.combine(current_date, work_end, tzinfo=tz)
+        # Determine the counting window for this day
+        day_start = datetime.combine(current_date, dt_time(0, 0), tzinfo=tz)
+        day_end = datetime.combine(current_date, dt_time(23, 59, 59), tzinfo=tz) + timedelta(seconds=1)
 
         # Clamp to received/replied times
         if current_date == received_local.date():
@@ -206,11 +188,11 @@ def calculate_adjusted_hours(
 
         # Only count if there's positive time
         if day_end > day_start:
-            total_work_seconds += (day_end - day_start).total_seconds()
+            total_seconds += (day_end - day_start).total_seconds()
 
         current_date += timedelta(days=1)
 
-    return total_work_seconds / 3600
+    return total_seconds / 3600
 
 
 # Thread-local storage for Gmail service
@@ -382,8 +364,6 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                         adjusted_hours = calculate_adjusted_hours(
                             m["date"],
                             parsed[j]["date"],
-                            work_settings["work_start"],
-                            work_settings["work_end"],
                             work_settings["timezone"],
                             work_settings["exclude_weekends"],
                             ooo_dates or set()
