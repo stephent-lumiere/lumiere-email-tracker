@@ -185,7 +185,7 @@ def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool
 def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False, exclude_long_responses: bool = True) -> pd.DataFrame:
     """
     Fetch aggregated stats from Supabase daily_stats table.
-    If exclude_long_responses is True, filters out response pairs > 168 hours (7 days).
+    If exclude_long_responses is True, filters out response pairs > 120 hours (5 days).
     """
     import time
 
@@ -275,7 +275,7 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
             pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
             pairs_df = pairs_df.dropna(subset=[hours_col])
 
-            # Filter out responses > 7 days (168 hours) if enabled, but keep whitelisted pairs
+            # Filter out responses > 5 days (120 hours) if enabled, but keep whitelisted pairs
             if exclude_long_responses:
                 try:
                     wl_result = supabase.table("whitelisted_response_pairs").select(
@@ -284,13 +284,13 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
                     if wl_result.data:
                         wl_keys = {(wp["thread_id"], wp["replied_at"]) for wp in wl_result.data}
                         pairs_df = pairs_df[
-                            (pairs_df[hours_col] <= 168) |
+                            (pairs_df[hours_col] <= 120) |
                             pairs_df.apply(lambda r: (r["thread_id"], r["replied_at"]) in wl_keys, axis=1)
                         ]
                     else:
-                        pairs_df = pairs_df[pairs_df[hours_col] <= 168]
+                        pairs_df = pairs_df[pairs_df[hours_col] <= 120]
                 except Exception:
-                    pairs_df = pairs_df[pairs_df[hours_col] <= 168]
+                    pairs_df = pairs_df[pairs_df[hours_col] <= 120]
 
             # Compute both average and median per user from raw pairs
             user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
@@ -645,9 +645,9 @@ with st.sidebar:
 
     # Exclude long responses toggle
     exclude_long_responses = st.checkbox(
-        "Exclude responses > 7 days",
+        "Exclude responses > 5 days",
         value=True,
-        help="Filter out response pairs where the reply took more than 7 days (168 hours)"
+        help="Filter out response pairs where the reply took more than 5 days (120 hours)"
     )
 
     # Explainer for each time window
@@ -656,7 +656,7 @@ with st.sidebar:
 
     days = (end_date - start_date).days
 
-    filter_note = " Responses taking longer than 7 days are excluded." if exclude_long_responses else ""
+    filter_note = " Responses taking longer than 5 days are excluded." if exclude_long_responses else ""
 
     if use_adjusted:
         st.info(f"""
@@ -1218,7 +1218,7 @@ with tab_dashboard:
 
             # Mark rows as excluded (manual, or >7d unless whitelisted)
             display_pairs['is_excluded'] = display_pairs.apply(
-                lambda r: r['excluded'] or (exclude_long_responses and r['response_hours'] > 168 and not r['whitelisted']),
+                lambda r: r['excluded'] or (exclude_long_responses and r['response_hours'] > 120 and not r['whitelisted']),
                 axis=1
             )
 
@@ -1306,7 +1306,7 @@ with tab_dashboard:
                                 exc_id = row['excluded_id']
                                 if exc_id:
                                     restore_response_pair(str(exc_id))
-                            elif exclude_long_responses and row['response_hours'] > 168:
+                            elif exclude_long_responses and row['response_hours'] > 120:
                                 # Excluded by >7d filter — whitelist it
                                 whitelist_response_pair({
                                     "thread_id": row['thread_id'],
@@ -1388,7 +1388,7 @@ with tab_dashboard:
         Some response pairs are excluded from metric calculations and marked with a tag in the response pairs table:
 
         - **[excluded]** — Manually excluded via the checkbox selection and "Exclude Selected" button. Use "Restore Selected" to include them again.
-        - **[>7d]** — Automatically excluded because the response took longer than 7 days (168 hours). This filter is controlled by the "Exclude responses > 7 days" checkbox in the sidebar. You can also restore individual >7d pairs using "Restore Selected" — restored pairs will stay included even with the >7d filter on.
+        - **[>5d]** — Automatically excluded because the response took longer than 5 days (120 hours). This filter is controlled by the "Exclude responses > 5 days" checkbox in the sidebar. You can also restore individual >5d pairs using "Restore Selected" — restored pairs will stay included even with the filter on.
 
         Excluded pairs still appear in the table for visibility but are not counted toward the summary metrics above.
         """)
