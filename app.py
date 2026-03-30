@@ -4,7 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import requests
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, time as dt_time, timezone
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -182,6 +183,90 @@ def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool
     except Exception as e:
         return False, f"Error: {str(e)}"
 
+def get_user_ooo_dates(user_email: str) -> set:
+    """Fetch all OOO dates for a user as a set of date objects."""
+    ooo_dates = set()
+    try:
+        supabase = get_supabase()
+        result = supabase.table("user_out_of_office").select(
+            "start_date, end_date"
+        ).eq("user_email", user_email).execute()
+        if result.data:
+            for row in result.data:
+                start = datetime.fromisoformat(row["start_date"]).date()
+                end = datetime.fromisoformat(row["end_date"]).date()
+                current = start
+                while current <= end:
+                    ooo_dates.add(current)
+                    current += timedelta(days=1)
+    except Exception:
+        pass
+    return ooo_dates
+
+
+def get_user_work_settings(user_email: str) -> dict:
+    """Fetch work settings for a user (timezone, exclude_weekends)."""
+    default_settings = {"timezone": "America/New_York", "exclude_weekends": True}
+    try:
+        supabase = get_supabase()
+        result = supabase.table("tracked_users").select(
+            "timezone, exclude_weekends"
+        ).eq("email", user_email).execute()
+        if result.data:
+            row = result.data[0]
+            return {
+                "timezone": row.get("timezone") or "America/New_York",
+                "exclude_weekends": row.get("exclude_weekends", True),
+            }
+    except Exception:
+        pass
+    return default_settings
+
+
+def calculate_adjusted_hours(
+    received_at: datetime,
+    replied_at: datetime,
+    user_tz: str,
+    exclude_weekends: bool,
+    ooo_dates: set,
+) -> float:
+    """Calculate adjusted hours between received_at and replied_at, excluding weekends and OOO dates."""
+    try:
+        tz = ZoneInfo(user_tz)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    received_local = received_at.astimezone(tz)
+    replied_local = replied_at.astimezone(tz)
+
+    total_seconds = 0
+    current_date = received_local.date()
+    end_date = replied_local.date()
+
+    while current_date <= end_date:
+        if exclude_weekends and current_date.weekday() >= 5:
+            current_date += timedelta(days=1)
+            continue
+        if current_date in ooo_dates:
+            current_date += timedelta(days=1)
+            continue
+
+        day_start = datetime.combine(current_date, dt_time(0, 0), tzinfo=tz)
+        day_end = datetime.combine(current_date, dt_time(23, 59, 59), tzinfo=tz) + timedelta(seconds=1)
+
+        if current_date == received_local.date():
+            day_start = max(day_start, received_local)
+        if current_date == replied_local.date():
+            day_end = min(day_end, replied_local)
+
+        if day_end > day_start:
+            total_seconds += (day_end - day_start).total_seconds()
+
+        current_date += timedelta(days=1)
+
+    return total_seconds / 3600
+
+
 def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False, exclude_long_responses: bool = True) -> pd.DataFrame:
     """
     Fetch aggregated stats from Supabase daily_stats table.
@@ -232,13 +317,19 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
     # (daily_stats aggregation loses accuracy due to equal-weight-per-day averaging)
     hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
     try:
+        # Always fetch received_at so we can recalculate adjusted hours dynamically
+        # (stored adjusted_response_hours may be stale if OOO was added after tracking)
+        select_cols = "user_email, thread_id, replied_at, received_at, response_hours"
+        if not use_adjusted:
+            select_cols = "user_email, thread_id, replied_at, " + hours_col
+
         # Fetch ALL response pairs using pagination (Supabase caps at 1000 per request)
         all_pairs_data = []
         batch_size = 1000
         offset = 0
         while True:
             pairs_batch = supabase.table("response_pairs").select(
-                "user_email, thread_id, replied_at, " + hours_col
+                select_cols
             ).gte(
                 "replied_at", start_date.isoformat()
             ).lte(
@@ -254,6 +345,34 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
 
         if all_pairs_data:
             pairs_df = pd.DataFrame(all_pairs_data)
+
+            # Recalculate adjusted hours dynamically using current OOO and work settings
+            # so that OOO periods added after tracking are correctly reflected
+            if use_adjusted:
+                user_ooo_cache = {}
+                user_settings_cache = {}
+
+                def recalc_adjusted(row):
+                    email = row["user_email"]
+                    if email not in user_ooo_cache:
+                        user_ooo_cache[email] = get_user_ooo_dates(email)
+                        user_settings_cache[email] = get_user_work_settings(email)
+                    ooo = user_ooo_cache[email]
+                    settings = user_settings_cache[email]
+                    try:
+                        recv = datetime.fromisoformat(row["received_at"])
+                        repl = datetime.fromisoformat(row["replied_at"])
+                        if recv.tzinfo is None:
+                            recv = recv.replace(tzinfo=timezone.utc)
+                        if repl.tzinfo is None:
+                            repl = repl.replace(tzinfo=timezone.utc)
+                        return calculate_adjusted_hours(
+                            recv, repl, settings["timezone"], settings["exclude_weekends"], ooo
+                        )
+                    except Exception:
+                        return row.get("response_hours")
+
+                pairs_df["adjusted_response_hours"] = pairs_df.apply(recalc_adjusted, axis=1)
 
             # Try to filter out excluded pairs (table may not exist yet)
             try:
