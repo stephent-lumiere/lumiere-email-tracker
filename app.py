@@ -604,7 +604,7 @@ def get_received_emails_stats(user_email: str, start_date: date, end_date: date)
     return {"total": total, "replied": replied, "rate": rate}
 
 
-def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10) -> pd.DataFrame:
+def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10, use_adjusted: bool = False) -> pd.DataFrame:
     """
     Fetch the most recent response pairs for a specific user within a date range.
     Includes thread_id and exclusion status for the exclude/restore UI.
@@ -628,8 +628,9 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
 
     df = pd.DataFrame(result.data)
 
-    # Keep raw replied_at for exclusion logic
+    # Keep raw timestamps for exclusion logic and adjusted recalculation
     df['raw_replied_at'] = df['replied_at']
+    df['raw_received_at'] = df['received_at']
 
     # Fetch excluded pairs and mark status
     try:
@@ -662,6 +663,29 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
         df['whitelisted'] = False
         df['whitelisted_id'] = None
 
+    # Dynamically recalculate adjusted hours using current OOO and work settings
+    if use_adjusted:
+        ooo_dates = get_user_ooo_dates(user_email)
+        work_settings = get_user_work_settings(user_email)
+
+        def calc_adjusted(row):
+            try:
+                recv = datetime.fromisoformat(str(row["raw_received_at"]))
+                repl = datetime.fromisoformat(str(row["raw_replied_at"]))
+                if recv.tzinfo is None:
+                    recv = recv.replace(tzinfo=timezone.utc)
+                if repl.tzinfo is None:
+                    repl = repl.replace(tzinfo=timezone.utc)
+                return calculate_adjusted_hours(
+                    recv, repl, work_settings["timezone"], work_settings["exclude_weekends"], ooo_dates
+                )
+            except Exception:
+                return row["response_hours"]
+
+        df['display_hours'] = df.apply(calc_adjusted, axis=1)
+    else:
+        df['display_hours'] = df['response_hours']
+
     # Format the data for display
     df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
     df['replied_at'] = pd.to_datetime(df['replied_at']).dt.strftime('%b %d, %H:%M')
@@ -677,7 +701,7 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
             remaining_hours = int(hours % 24)
             return f"{days}d {remaining_hours}h"
 
-    df['response_time'] = df['response_hours'].apply(format_response_time)
+    df['response_time'] = df['display_hours'].apply(format_response_time)
 
     # Truncate long fields
     df['external_sender'] = df['external_sender'].str[:35]
@@ -1316,15 +1340,15 @@ with tab_dashboard:
             )
             num_pairs = 10000 if pairs_option == "All" else pairs_option
 
-        recent_pairs = get_recent_response_pairs(selected_individual, start_date, end_date, limit=num_pairs)
+        recent_pairs = get_recent_response_pairs(selected_individual, start_date, end_date, limit=num_pairs, use_adjusted=use_adjusted)
 
         if not recent_pairs.empty:
             st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
 
             # Build display dataframe with Select checkbox
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id']].copy()
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'display_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id']].copy()
             display_pairs.insert(0, 'Select', False)
-            display_pairs['Response (hrs)'] = display_pairs['response_hours'].round(1)
+            display_pairs['Response (hrs)'] = display_pairs['display_hours'].round(1)
 
             # Mark rows as excluded (manual, or >7d unless whitelisted)
             display_pairs['is_excluded'] = display_pairs.apply(
