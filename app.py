@@ -65,15 +65,24 @@ def recalculate_daily_stats(user_email: str, dates: list):
             "thread_id, replied_at"
         ).eq("user_email", user_email).execute()
 
+        def _norm_ts(ts):
+            try:
+                dt = datetime.fromisoformat(str(ts))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                return str(ts)
+
         excluded_keys = set()
         if excluded_result.data:
             for ep in excluded_result.data:
-                excluded_keys.add((ep["thread_id"], ep["replied_at"]))
+                excluded_keys.add((ep["thread_id"], _norm_ts(ep["replied_at"])))
 
         hours_list = []
         if pairs_result.data:
             for p in pairs_result.data:
-                if (p["thread_id"], p["replied_at"]) not in excluded_keys:
+                if (p["thread_id"], _norm_ts(p["replied_at"])) not in excluded_keys:
                     hours_list.append(p["response_hours"])
 
         stats_update = {
@@ -380,12 +389,22 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
                     "thread_id, replied_at"
                 ).execute()
                 if excluded_result.data:
+                    def _norm_ts(ts):
+                        """Normalize a timestamp string to UTC seconds precision for reliable comparison."""
+                        try:
+                            dt = datetime.fromisoformat(str(ts))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                        except Exception:
+                            return str(ts)
+
                     excluded_keys = {
-                        (ep["thread_id"], ep["replied_at"]) for ep in excluded_result.data
+                        (ep["thread_id"], _norm_ts(ep["replied_at"])) for ep in excluded_result.data
                     }
                     pairs_df = pairs_df[
                         ~pairs_df.apply(
-                            lambda r: (r["thread_id"], r["replied_at"]) in excluded_keys, axis=1
+                            lambda r: (r["thread_id"], _norm_ts(r["replied_at"])) in excluded_keys, axis=1
                         )
                     ]
             except Exception:
