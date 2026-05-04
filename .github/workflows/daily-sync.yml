@@ -18,6 +18,14 @@ on:
         options:
           - 'false'
           - 'true'
+      recompute_stats:
+        description: 'Recompute daily_stats from authoritative tables (one-time data repair, no Gmail fetch)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   sync:
@@ -55,5 +63,8 @@ jobs:
           fi
           if [ "${{ github.event.inputs.backfill }}" == "true" ]; then
             ARGS="$ARGS --backfill"
+          fi
+          if [ "${{ github.event.inputs.recompute_stats }}" == "true" ]; then
+            ARGS="$ARGS --recompute-stats"
           fi
           python tracker_supabase.py $ARGS
