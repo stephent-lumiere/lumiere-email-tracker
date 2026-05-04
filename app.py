@@ -5,9 +5,29 @@ import plotly.graph_objects as go
 import os
 import requests
 from datetime import datetime, timedelta, date, time as dt_time, timezone
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
+
+
+# How long cached Supabase reads stay fresh (in seconds). The data only
+# refreshes once a day from the GitHub Actions sync, so 5 minutes of staleness
+# is fine and dramatically cuts network round-trips when the user toggles
+# filters / time windows.
+CACHE_TTL_SECONDS = 300
+
+
+def _clear_data_caches():
+    """
+    Invalidate every @st.cache_data entry. Call this from any place that
+    mutates Supabase (Refresh button, add/edit user, exclude/restore pair,
+    OOO edits, etc.) so the dashboard re-reads fresh data.
+    """
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
 def exclude_response_pair(pair_data: dict):
     """Insert a response pair into the excluded_response_pairs table."""
@@ -21,6 +41,7 @@ def restore_response_pair(excluded_id: str):
     supabase = get_supabase()
     supabase.table("excluded_response_pairs").delete().eq("id", excluded_id).execute()
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_excluded_pairs(user_email: str = None) -> list:
     """Fetch excluded pairs, optionally filtered by user."""
     supabase = get_supabase()
@@ -42,6 +63,7 @@ def remove_whitelisted_pair(whitelist_id: str):
     supabase = get_supabase()
     supabase.table("whitelisted_response_pairs").delete().eq("id", whitelist_id).execute()
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_whitelisted_pairs(user_email: str = None) -> list:
     """Fetch whitelisted pairs, optionally filtered by user."""
     supabase = get_supabase()
@@ -192,8 +214,12 @@ def trigger_github_workflow(user_email: str = "", backfill: bool = True) -> bool
     except Exception as e:
         return False, f"Error: {str(e)}"
 
-def get_user_ooo_dates(user_email: str) -> set:
-    """Fetch all OOO dates for a user as a set of date objects."""
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def get_user_ooo_dates(user_email: str) -> frozenset:
+    """Fetch all OOO dates for a user as a frozenset of date objects.
+    Returned as a frozenset so callers can pass it as a hashable key into
+    the @lru_cache'd adjusted-hours helper.
+    """
     ooo_dates = set()
     try:
         supabase = get_supabase()
@@ -210,9 +236,10 @@ def get_user_ooo_dates(user_email: str) -> set:
                     current += timedelta(days=1)
     except Exception:
         pass
-    return ooo_dates
+    return frozenset(ooo_dates)
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_user_work_settings(user_email: str) -> dict:
     """Fetch work settings for a user (timezone, exclude_weekends)."""
     default_settings = {"timezone": "America/New_York", "exclude_weekends": True}
@@ -239,7 +266,29 @@ def calculate_adjusted_hours(
     exclude_weekends: bool,
     ooo_dates: set,
 ) -> float:
-    """Calculate adjusted hours between received_at and replied_at, excluding weekends and OOO dates."""
+    """Calculate adjusted hours between received_at and replied_at, excluding weekends and OOO dates.
+    Internally normalizes ooo_dates to a frozenset so the result can be memoized."""
+    return _calculate_adjusted_hours_cached(
+        received_at,
+        replied_at,
+        user_tz,
+        exclude_weekends,
+        frozenset(ooo_dates) if ooo_dates else frozenset(),
+    )
+
+
+# Plain @lru_cache (not @st.cache_data) because the inputs are simple and we
+# call this thousands of times per render in the adjusted-hours code path —
+# Streamlit's cache_data has higher overhead per call than lru_cache. The
+# cache is process-local and resets on app restart, which is fine.
+@lru_cache(maxsize=50_000)
+def _calculate_adjusted_hours_cached(
+    received_at: datetime,
+    replied_at: datetime,
+    user_tz: str,
+    exclude_weekends: bool,
+    ooo_dates: frozenset,
+) -> float:
     try:
         tz = ZoneInfo(user_tz)
     except Exception:
@@ -276,14 +325,42 @@ def calculate_adjusted_hours(
     return total_seconds / 3600
 
 
+def _norm_ts(ts) -> str:
+    """Normalize a timestamp string to UTC seconds precision for reliable comparison.
+    Used as the canonical form for (thread_id, replied_at) exclusion/whitelist keys."""
+    try:
+        dt = datetime.fromisoformat(str(ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool = False, exclude_long_responses: bool = True) -> pd.DataFrame:
     """
-    Fetch aggregated stats from Supabase daily_stats table.
-    If exclude_long_responses is True, filters out response pairs > 120 hours (5 days).
+    Fetch aggregated per-user stats from Supabase for the given date range.
+
+    Caching: this is the heaviest read on the dashboard. Wrapping it with
+    @st.cache_data means changing the domain/team/individual filter is a
+    cache hit (no network round-trip), and only changing start_date /
+    end_date / use_adjusted / exclude_long_responses re-runs the queries.
+
+    Performance notes:
+    - response_pairs is paginated to handle Supabase's 1000-row default cap.
+    - excluded_response_pairs and whitelisted_response_pairs are filtered by
+      replied_at on the same date range so we don't full-scan those tables.
+    - All per-row filtering is done with vectorized pandas Series.isin (not
+      DataFrame.apply(axis=1)).
+    - When use_adjusted=True, calculate_adjusted_hours is memoized via
+      lru_cache so repeated (recv, repl, tz, exclude_weekends, ooo) tuples
+      only do the date-loop math once.
     """
     import time
 
     # Retry logic for transient network errors
+    result = None
     for attempt in range(3):
         try:
             supabase = get_supabase()
@@ -299,43 +376,30 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
                 continue
             raise e
 
-    if not result.data:
+    if not result or not result.data:
         return pd.DataFrame()
 
     df = pd.DataFrame(result.data)
 
-    # Choose columns based on mode
-    avg_col = "avg_adjusted_hours" if use_adjusted else "avg_response_hours"
-    median_col = "median_adjusted_hours" if use_adjusted else "median_response_hours"
-
-    # Handle missing adjusted columns (for historical data)
-    if use_adjusted:
-        if avg_col not in df.columns:
-            df[avg_col] = df.get("avg_response_hours", 0)
-        if median_col not in df.columns:
-            df[median_col] = df.get("median_response_hours", 0)
-
-    # Aggregate email counts by user (these sums are correct)
+    # Aggregate email counts by user (these sums are correct from daily_stats).
     aggregated = df.groupby("user_email").agg({
         "emails_received": "sum",
         "emails_sent": "sum",
         "response_pairs_count": "sum",
     }).reset_index()
 
-    # Compute true average and median from response_pairs table directly
-    # (daily_stats aggregation loses accuracy due to equal-weight-per-day averaging)
-    hours_col = "adjusted_response_hours" if use_adjusted else "response_hours"
-    try:
-        # Always fetch received_at so we can recalculate adjusted hours dynamically
-        # (stored adjusted_response_hours may be stale if OOO was added after tracking)
-        select_cols = "user_email, thread_id, replied_at, received_at, response_hours"
-        if not use_adjusted:
-            select_cols = "user_email, thread_id, replied_at, " + hours_col
+    # Pull raw response_pairs so we can compute true mean/median (per-day
+    # medians can't be combined into a true per-user median). We always fetch
+    # response_hours; received_at is only needed for the adjusted recalc.
+    select_cols = "user_email, thread_id, replied_at, received_at, response_hours"
+    if not use_adjusted:
+        # Without received_at, the bytes-on-the-wire shrinks meaningfully.
+        select_cols = "user_email, thread_id, replied_at, response_hours"
 
-        # Fetch ALL response pairs using pagination (Supabase caps at 1000 per request)
-        all_pairs_data = []
-        batch_size = 1000
-        offset = 0
+    all_pairs_data = []
+    batch_size = 1000
+    offset = 0
+    try:
         while True:
             pairs_batch = supabase.table("response_pairs").select(
                 select_cols
@@ -349,138 +413,143 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
                 break
             all_pairs_data.extend(pairs_batch.data)
             if len(pairs_batch.data) < batch_size:
-                break  # Last page
+                break
             offset += batch_size
-
-        if all_pairs_data:
-            pairs_df = pd.DataFrame(all_pairs_data)
-
-            # Recalculate adjusted hours dynamically using current OOO and work settings
-            # so that OOO periods added after tracking are correctly reflected
-            if use_adjusted:
-                user_ooo_cache = {}
-                user_settings_cache = {}
-
-                def recalc_adjusted(row):
-                    email = row["user_email"]
-                    if email not in user_ooo_cache:
-                        user_ooo_cache[email] = get_user_ooo_dates(email)
-                        user_settings_cache[email] = get_user_work_settings(email)
-                    ooo = user_ooo_cache[email]
-                    settings = user_settings_cache[email]
-                    try:
-                        recv = datetime.fromisoformat(row["received_at"])
-                        repl = datetime.fromisoformat(row["replied_at"])
-                        if recv.tzinfo is None:
-                            recv = recv.replace(tzinfo=timezone.utc)
-                        if repl.tzinfo is None:
-                            repl = repl.replace(tzinfo=timezone.utc)
-                        return calculate_adjusted_hours(
-                            recv, repl, settings["timezone"], settings["exclude_weekends"], ooo
-                        )
-                    except Exception:
-                        return row.get("response_hours")
-
-                pairs_df["adjusted_response_hours"] = pairs_df.apply(recalc_adjusted, axis=1)
-
-            # Try to filter out excluded pairs (table may not exist yet)
-            try:
-                excluded_result = supabase.table("excluded_response_pairs").select(
-                    "thread_id, replied_at"
-                ).execute()
-                if excluded_result.data:
-                    def _norm_ts(ts):
-                        """Normalize a timestamp string to UTC seconds precision for reliable comparison."""
-                        try:
-                            dt = datetime.fromisoformat(str(ts))
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-                        except Exception:
-                            return str(ts)
-
-                    excluded_keys = {
-                        (ep["thread_id"], _norm_ts(ep["replied_at"])) for ep in excluded_result.data
-                    }
-                    pairs_df = pairs_df[
-                        ~pairs_df.apply(
-                            lambda r: (r["thread_id"], _norm_ts(r["replied_at"])) in excluded_keys, axis=1
-                        )
-                    ]
-            except Exception:
-                pass  # Table doesn't exist yet, no exclusions to apply
-
-            pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
-            pairs_df = pairs_df.dropna(subset=[hours_col])
-
-            # Filter out responses > 5 days (120 hours) if enabled, but keep whitelisted pairs
-            if exclude_long_responses:
-                try:
-                    wl_result = supabase.table("whitelisted_response_pairs").select(
-                        "thread_id, replied_at"
-                    ).execute()
-                    if wl_result.data:
-                        wl_keys = {(wp["thread_id"], wp["replied_at"]) for wp in wl_result.data}
-                        pairs_df = pairs_df[
-                            (pairs_df[hours_col] <= 120) |
-                            pairs_df.apply(lambda r: (r["thread_id"], r["replied_at"]) in wl_keys, axis=1)
-                        ]
-                    else:
-                        pairs_df = pairs_df[pairs_df[hours_col] <= 120]
-                except Exception:
-                    pairs_df = pairs_df[pairs_df[hours_col] <= 120]
-
-            # Compute both average and median per user from raw pairs
-            user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
-            user_stats.columns = ["user_email", "avg_response_hours", "median_response_hours"]
-            aggregated = aggregated.merge(user_stats, on="user_email", how="left")
-        else:
-            aggregated["avg_response_hours"] = None
-            aggregated["median_response_hours"] = None
     except Exception as e:
-        print(f"Error computing stats from response_pairs: {e}")
-        # Fallback: compute weighted average from daily_stats
-        def compute_weighted_avg(group):
-            weights = group["response_pairs_count"]
-            values = group[avg_col]
-            mask = (weights > 0) & values.notna()
-            if mask.any():
-                return (values[mask] * weights[mask]).sum() / weights[mask].sum()
-            return None
+        print(f"Error fetching response_pairs: {e}")
+        all_pairs_data = []
 
-        weighted_avgs = df.groupby("user_email").apply(compute_weighted_avg).reset_index()
-        weighted_avgs.columns = ["user_email", "avg_response_hours"]
-        aggregated = aggregated.merge(weighted_avgs, on="user_email", how="left")
-        aggregated["median_response_hours"] = aggregated["avg_response_hours"]
+    hours_col = "response_hours"
 
-    # Fetch user info (domain, display_name, team_function) from tracked_users
-    users_result = supabase.table("tracked_users").select("email, domain, display_name, team_function").execute()
-    if users_result.data:
+    if all_pairs_data:
+        pairs_df = pd.DataFrame(all_pairs_data)
+
+        # Pre-normalize replied_at once (used for excluded/whitelisted lookup).
+        pairs_df["_replied_at_norm"] = pairs_df["replied_at"].astype(str).map(_norm_ts)
+
+        # Filter out excluded pairs. We bound the query by the same date
+        # range so we don't full-scan the table.
+        try:
+            excluded_result = supabase.table("excluded_response_pairs").select(
+                "thread_id, replied_at"
+            ).gte(
+                "replied_at", start_date.isoformat()
+            ).lte(
+                "replied_at", end_date.isoformat() + "T23:59:59"
+            ).execute()
+            if excluded_result.data:
+                excluded_keys = {
+                    (ep["thread_id"], _norm_ts(ep["replied_at"]))
+                    for ep in excluded_result.data
+                }
+                # Vectorized filter: build a tuple Series, then .isin.
+                key_series = pd.Series(
+                    list(zip(pairs_df["thread_id"], pairs_df["_replied_at_norm"])),
+                    index=pairs_df.index,
+                )
+                pairs_df = pairs_df[~key_series.isin(excluded_keys)]
+        except Exception:
+            pass  # Table doesn't exist yet, no exclusions to apply
+
+        # Recalculate adjusted hours dynamically using current OOO and work
+        # settings so that OOO periods added after tracking are correctly
+        # reflected. Cached via lru_cache, so repeated input tuples are free.
+        if use_adjusted:
+            user_settings_cache: dict = {}
+            user_ooo_cache: dict = {}
+
+            def _recalc(row):
+                email = row["user_email"]
+                if email not in user_settings_cache:
+                    user_settings_cache[email] = get_user_work_settings(email)
+                    user_ooo_cache[email] = get_user_ooo_dates(email)
+                settings = user_settings_cache[email]
+                ooo = user_ooo_cache[email]  # already a frozenset
+                try:
+                    recv = datetime.fromisoformat(str(row["received_at"]))
+                    repl = datetime.fromisoformat(str(row["replied_at"]))
+                    if recv.tzinfo is None:
+                        recv = recv.replace(tzinfo=timezone.utc)
+                    if repl.tzinfo is None:
+                        repl = repl.replace(tzinfo=timezone.utc)
+                    return _calculate_adjusted_hours_cached(
+                        recv, repl, settings["timezone"], settings["exclude_weekends"], ooo
+                    )
+                except Exception:
+                    return row.get("response_hours")
+
+            pairs_df["adjusted_response_hours"] = pairs_df.apply(_recalc, axis=1)
+            hours_col = "adjusted_response_hours"
+
+        pairs_df[hours_col] = pd.to_numeric(pairs_df[hours_col], errors="coerce")
+        pairs_df = pairs_df.dropna(subset=[hours_col])
+
+        # Filter out responses > 5 days (120 hours), keeping whitelisted pairs.
+        if exclude_long_responses:
+            try:
+                wl_result = supabase.table("whitelisted_response_pairs").select(
+                    "thread_id, replied_at"
+                ).gte(
+                    "replied_at", start_date.isoformat()
+                ).lte(
+                    "replied_at", end_date.isoformat() + "T23:59:59"
+                ).execute()
+                if wl_result.data:
+                    wl_keys = {
+                        (wp["thread_id"], _norm_ts(wp["replied_at"]))
+                        for wp in wl_result.data
+                    }
+                    wl_key_series = pd.Series(
+                        list(zip(pairs_df["thread_id"], pairs_df["_replied_at_norm"])),
+                        index=pairs_df.index,
+                    )
+                    is_whitelisted = wl_key_series.isin(wl_keys)
+                    pairs_df = pairs_df[(pairs_df[hours_col] <= 120) | is_whitelisted]
+                else:
+                    pairs_df = pairs_df[pairs_df[hours_col] <= 120]
+            except Exception:
+                pairs_df = pairs_df[pairs_df[hours_col] <= 120]
+
+        # Drop the helper column before aggregating.
+        pairs_df = pairs_df.drop(columns=["_replied_at_norm"], errors="ignore")
+
+        # True per-user mean and median from the raw response_hours values.
+        user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
+        user_stats.columns = ["user_email", "avg_response_hours", "median_response_hours"]
+        aggregated = aggregated.merge(user_stats, on="user_email", how="left")
+    else:
+        aggregated["avg_response_hours"] = None
+        aggregated["median_response_hours"] = None
+
+    # Fetch user info (domain, display_name, team_function) once.
+    try:
+        users_result = supabase.table("tracked_users").select(
+            "email, domain, display_name, team_function"
+        ).execute()
+    except Exception:
+        users_result = None
+
+    if users_result and users_result.data:
         users_df = pd.DataFrame(users_result.data)
         aggregated = aggregated.merge(
-            users_df,
-            left_on="user_email",
-            right_on="email",
-            how="left"
+            users_df, left_on="user_email", right_on="email", how="left"
         )
-        # Extract domain from email if not in tracked_users
-        aggregated["domain"] = aggregated.apply(
-            lambda row: row["domain"] if pd.notna(row.get("domain")) else row["user_email"].split("@")[1] if "@" in row["user_email"] else "unknown",
-            axis=1
-        )
-        aggregated["display_name"] = aggregated.apply(
-            lambda row: row["display_name"] if pd.notna(row.get("display_name")) else row["user_email"].split("@")[0],
-            axis=1
-        )
-        # Handle team_function
-        aggregated["team_function"] = aggregated.apply(
-            lambda row: row["team_function"] if pd.notna(row.get("team_function")) else "unknown",
-            axis=1
-        )
+
+    # Vectorized fallbacks for missing user info — one ufunc each, no
+    # apply(axis=1).
+    email_local_part = aggregated["user_email"].str.split("@").str[0]
+    email_domain_part = aggregated["user_email"].str.split("@").str[1].fillna("unknown")
+    if "domain" in aggregated.columns:
+        aggregated["domain"] = aggregated["domain"].fillna(email_domain_part)
     else:
-        # Fallback: extract domain from email
-        aggregated["domain"] = aggregated["user_email"].apply(lambda x: x.split("@")[1] if "@" in x else "unknown")
-        aggregated["display_name"] = aggregated["user_email"].apply(lambda x: x.split("@")[0])
+        aggregated["domain"] = email_domain_part
+    if "display_name" in aggregated.columns:
+        aggregated["display_name"] = aggregated["display_name"].fillna(email_local_part)
+    else:
+        aggregated["display_name"] = email_local_part
+    if "team_function" in aggregated.columns:
+        aggregated["team_function"] = aggregated["team_function"].fillna("unknown")
+    else:
         aggregated["team_function"] = "unknown"
 
     # Rename columns to match dashboard format
@@ -496,19 +565,21 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         "team_function": "Team",
     })
 
-    # Round numeric columns (convert to numeric first to handle nulls)
     aggregated["Avg Response (hrs)"] = pd.to_numeric(aggregated["Avg Response (hrs)"], errors='coerce').round(1)
     aggregated["Median Response (hrs)"] = pd.to_numeric(aggregated["Median Response (hrs)"], errors='coerce').round(1)
 
-    # Reorder columns
-    column_order = ["Name", "Email", "Domain", "Team", "Median Response (hrs)", "Avg Response (hrs)", "Responses Tracked", "Emails Received", "Emails Sent"]
-    # Only include columns that exist
+    column_order = [
+        "Name", "Email", "Domain", "Team",
+        "Median Response (hrs)", "Avg Response (hrs)",
+        "Responses Tracked", "Emails Received", "Emails Sent",
+    ]
     column_order = [c for c in column_order if c in aggregated.columns]
     aggregated = aggregated[column_order]
 
     return aggregated
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.DataFrame:
     """
     Fetch daily trend data for a specific user.
@@ -529,6 +600,7 @@ def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.Dat
     return pd.DataFrame(result.data)
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_received_emails(user_email: str, start_date: date, end_date: date, limit: int = 50) -> pd.DataFrame:
     """
     Fetch all received emails for a user within a date range.
@@ -586,6 +658,7 @@ def get_received_emails(user_email: str, start_date: date, end_date: date, limit
     return df
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_received_emails_stats(user_email: str, start_date: date, end_date: date) -> dict:
     """
     Get summary stats for received emails (total, replied, reply rate).
@@ -623,6 +696,7 @@ def get_received_emails_stats(user_email: str, start_date: date, end_date: date)
     return {"total": total, "replied": replied, "rate": rate}
 
 
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10, use_adjusted: bool = False) -> pd.DataFrame:
     """
     Fetch the most recent response pairs for a specific user within a date range.
@@ -846,6 +920,7 @@ with st.sidebar:
     # Refresh Button
     if st.button("Refresh Data", type="primary", use_container_width=True):
         st.cache_resource.clear()
+        _clear_data_caches()
         st.session_state.refresh_counter += 1
         st.rerun()
 
@@ -959,6 +1034,7 @@ with tab_manage:
                             st.info("Auto-fetch not configured. Add GITHUB_TOKEN to enable.")
 
                         st.cache_resource.clear()
+                        _clear_data_caches()
                     except Exception as e:
                         if "duplicate" in str(e).lower():
                             st.warning(f"{new_email} is already being tracked.")
@@ -1022,6 +1098,7 @@ with tab_manage:
                     supabase_edit.table("tracked_users").update({"team_function": new_team}).eq("email", selected_email).execute()
                     st.success(f"Updated team for {selected_email} to {new_team}")
                     st.cache_resource.clear()
+                    _clear_data_caches()
         else:
             st.write("No active users to edit.")
     except Exception as e:
@@ -1069,6 +1146,7 @@ with tab_manage:
                 }).eq("email", selected_hours_user["email"]).execute()
                 st.success(f"Updated settings for {selected_hours_user['email']}")
                 st.cache_resource.clear()
+                _clear_data_caches()
         else:
             st.write("No active users to edit.")
     except Exception as e:
@@ -1152,6 +1230,7 @@ with tab_manage:
                         }).execute()
                         st.success(f"Added OOO period for {ooo_email}")
                         st.cache_resource.clear()
+                        _clear_data_caches()
                         st.rerun()
                     else:
                         st.warning("End date must be on or after start date")
@@ -1438,6 +1517,7 @@ with tab_dashboard:
                             replied_dt = pd.to_datetime(row['raw_replied_at'])
                             affected_dates.add(replied_dt.date().isoformat())
                         recalculate_daily_stats(selected_individual, list(affected_dates))
+                        _clear_data_caches()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error excluding pairs: {e}")
@@ -1469,6 +1549,7 @@ with tab_dashboard:
                             replied_dt = pd.to_datetime(row['raw_replied_at'])
                             affected_dates.add(replied_dt.date().isoformat())
                         recalculate_daily_stats(selected_individual, list(affected_dates))
+                        _clear_data_caches()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error restoring pairs: {e}")

@@ -558,63 +558,193 @@ def save_received_emails(received_emails: list) -> int:
     return new_count
 
 
+def _compute_authoritative_daily_stats(
+    supabase: Client,
+    user_email: str,
+    date_str: str,
+    excluded_keys: set,
+) -> dict:
+    """
+    Build a daily_stats row for a (user_email, date_str) pair from the
+    authoritative tables (received_emails and response_pairs).
+
+    excluded_keys is a set of (thread_id, replied_at_iso_seconds_utc) tuples
+    that should be filtered out of the response_pairs aggregation.
+
+    Returns a dict ready for upsert (without emails_sent — caller decides that).
+    """
+    # Match the existing recalculate_daily_stats / app.py date-boundary pattern:
+    # half-open is cleaner but we use the same closed-range form already in use
+    # elsewhere in this codebase so all date filters behave identically.
+    day_start = date_str + "T00:00:00"
+    day_end = date_str + "T23:59:59"
+
+    # Authoritative emails_received: count rows in received_emails on this date.
+    # received_emails has a unique constraint on (thread_id, received_at), so
+    # this count never drifts as new threads are observed.
+    try:
+        recv_result = supabase.table("received_emails").select(
+            "id", count="exact"
+        ).eq("user_email", user_email).gte(
+            "received_at", day_start
+        ).lte(
+            "received_at", day_end
+        ).execute()
+        emails_received = recv_result.count or 0
+    except Exception:
+        # received_emails table may not exist for very old deployments;
+        # leave the stat unchanged by signalling None.
+        emails_received = None
+
+    # Authoritative response stats: pull all pairs whose replied_at lies on this
+    # date, drop any that are in excluded_response_pairs, then aggregate.
+    try:
+        pairs_result = supabase.table("response_pairs").select(
+            "thread_id, replied_at, response_hours, adjusted_response_hours"
+        ).eq("user_email", user_email).gte(
+            "replied_at", day_start
+        ).lte(
+            "replied_at", day_end
+        ).execute()
+        pair_rows = pairs_result.data or []
+    except Exception:
+        pair_rows = []
+
+    hours_list = []
+    adjusted_list = []
+    for p in pair_rows:
+        if p.get("response_hours") is None:
+            continue
+        if (p["thread_id"], _norm_replied_at(p["replied_at"])) in excluded_keys:
+            continue
+        hours_list.append(p["response_hours"])
+        if p.get("adjusted_response_hours") is not None:
+            adjusted_list.append(p["adjusted_response_hours"])
+
+    stats = {
+        "user_email": user_email,
+        "date": date_str,
+        "response_pairs_count": len(hours_list),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if emails_received is not None:
+        stats["emails_received"] = emails_received
+
+    if hours_list:
+        sorted_h = sorted(hours_list)
+        n = len(sorted_h)
+        median = sorted_h[n // 2] if n % 2 == 1 else (sorted_h[n // 2 - 1] + sorted_h[n // 2]) / 2
+        stats["avg_response_hours"] = round(sum(hours_list) / n, 2)
+        stats["median_response_hours"] = round(median, 2)
+        stats["min_response_hours"] = round(min(hours_list), 2)
+        stats["max_response_hours"] = round(max(hours_list), 2)
+    else:
+        # Active wipe: if there are no (non-excluded) pairs for this date, the
+        # response time stats should be NULL, not stale leftovers from before.
+        stats["avg_response_hours"] = None
+        stats["median_response_hours"] = None
+        stats["min_response_hours"] = None
+        stats["max_response_hours"] = None
+
+    if adjusted_list:
+        sorted_a = sorted(adjusted_list)
+        n_a = len(sorted_a)
+        median_a = sorted_a[n_a // 2] if n_a % 2 == 1 else (sorted_a[n_a // 2 - 1] + sorted_a[n_a // 2]) / 2
+        stats["avg_adjusted_hours"] = round(sum(adjusted_list) / n_a, 2)
+        stats["median_adjusted_hours"] = round(median_a, 2)
+
+    return stats
+
+
+def _norm_replied_at(ts: str) -> str:
+    """Normalize a replied_at timestamp to UTC, second precision, for set membership."""
+    try:
+        dt = datetime.fromisoformat(str(ts))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def _get_excluded_keys_for_user(supabase: Client, user_email: str) -> set:
+    """Fetch the set of (thread_id, normalized_replied_at) keys to exclude for a user."""
+    try:
+        excluded = supabase.table("excluded_response_pairs").select(
+            "thread_id, replied_at"
+        ).eq("user_email", user_email).execute()
+        if excluded.data:
+            return {(ep["thread_id"], _norm_replied_at(ep["replied_at"])) for ep in excluded.data}
+    except Exception:
+        pass
+    return set()
+
+
 def update_daily_stats(user_email: str, pairs: list, received: list, sent: list):
-    """Update daily stats for a user based on their response pairs and email counts."""
+    """
+    Update daily_stats for the dates touched by this run.
+
+    Counts are computed AUTHORITATIVELY from the underlying tables:
+      - emails_received from received_emails (unique on thread_id+received_at, monotonic)
+      - response_pairs_count and response time stats from response_pairs (same)
+
+    For emails_sent there is no per-message persistence layer, so we max-merge
+    with the existing value to avoid corrupting old dates when a daily sync
+    only sees a small sample of an old thread.
+
+    This makes the daily run self-healing: any date the run touches gets the
+    correct value regardless of how few/many threads happened to surface it.
+    """
     if not pairs and not received and not sent:
         return
 
+    from collections import Counter
     supabase = get_supabase()
 
-    # Group data by date
-    from collections import defaultdict, Counter
-    daily_hours = defaultdict(list)
-    daily_adjusted_hours = defaultdict(list)
-    received_counts = Counter(received)
-    sent_counts = Counter(sent)
-
+    # Build the set of dates this run touched.
+    sent_counts_in_run = Counter(sent)
+    received_dates = set(received)
+    pair_dates = set()
     for p in pairs:
-        # Parse the replied_at date
-        replied_at = datetime.fromisoformat(p["replied_at"].replace("Z", "+00:00"))
-        date_str = replied_at.date().isoformat()
-        daily_hours[date_str].append(p["response_hours"])
-        # Track adjusted hours if available
-        if p.get("adjusted_response_hours") is not None:
-            daily_adjusted_hours[date_str].append(p["adjusted_response_hours"])
+        try:
+            replied_at = datetime.fromisoformat(p["replied_at"].replace("Z", "+00:00"))
+            pair_dates.add(replied_at.date().isoformat())
+        except Exception:
+            pass
 
-    # Get all dates that have any activity
-    all_dates = set(daily_hours.keys()) | set(received_counts.keys()) | set(sent_counts.keys())
+    all_dates = received_dates | set(sent_counts_in_run.keys()) | pair_dates
+    if not all_dates:
+        return
 
-    # Upsert daily stats
+    excluded_keys = _get_excluded_keys_for_user(supabase, user_email)
+
+    # Pre-fetch existing emails_sent for all touched dates in one query so we
+    # can do max-merge without N round-trips.
+    existing_sent_by_date = {}
+    try:
+        sorted_dates = sorted(all_dates)
+        existing = supabase.table("daily_stats").select(
+            "date, emails_sent"
+        ).eq("user_email", user_email).gte(
+            "date", sorted_dates[0]
+        ).lte(
+            "date", sorted_dates[-1]
+        ).execute()
+        if existing.data:
+            for row in existing.data:
+                existing_sent_by_date[row["date"]] = row.get("emails_sent") or 0
+    except Exception:
+        pass
+
     for date_str in all_dates:
-        hours_list = daily_hours.get(date_str, [])
+        stats = _compute_authoritative_daily_stats(
+            supabase, user_email, date_str, excluded_keys
+        )
 
-        stats = {
-            "user_email": user_email,
-            "date": date_str,
-            "emails_received": received_counts.get(date_str, 0),
-            "emails_sent": sent_counts.get(date_str, 0),
-            "response_pairs_count": len(hours_list),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Only add response time stats if we have pairs
-        if hours_list:
-            sorted_hours = sorted(hours_list)
-            n = len(sorted_hours)
-            median = sorted_hours[n // 2] if n % 2 == 1 else (sorted_hours[n//2 - 1] + sorted_hours[n//2]) / 2
-            stats["avg_response_hours"] = round(sum(hours_list) / n, 2)
-            stats["median_response_hours"] = round(median, 2)
-            stats["min_response_hours"] = round(min(hours_list), 2)
-            stats["max_response_hours"] = round(max(hours_list), 2)
-
-        # Add adjusted hours stats if available
-        adjusted_list = daily_adjusted_hours.get(date_str, [])
-        if adjusted_list:
-            sorted_adjusted = sorted(adjusted_list)
-            n_adj = len(sorted_adjusted)
-            median_adj = sorted_adjusted[n_adj // 2] if n_adj % 2 == 1 else (sorted_adjusted[n_adj//2 - 1] + sorted_adjusted[n_adj//2]) / 2
-            stats["avg_adjusted_hours"] = round(sum(adjusted_list) / n_adj, 2)
-            stats["median_adjusted_hours"] = round(median_adj, 2)
+        # Max-merge emails_sent (no authoritative source today).
+        new_sent = sent_counts_in_run.get(date_str, 0)
+        existing_sent = existing_sent_by_date.get(date_str, 0)
+        stats["emails_sent"] = max(existing_sent, new_sent)
 
         try:
             supabase.table("daily_stats").upsert(
@@ -622,7 +752,7 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
                 on_conflict="user_email,date"
             ).execute()
         except Exception as e:
-            # If adjusted columns don't exist, retry without them
+            # If adjusted columns don't exist on this deployment, retry without them.
             if "avg_adjusted_hours" in str(e) or "median_adjusted_hours" in str(e):
                 stats.pop("avg_adjusted_hours", None)
                 stats.pop("median_adjusted_hours", None)
@@ -632,9 +762,81 @@ def update_daily_stats(user_email: str, pairs: list, received: list, sent: list)
                         on_conflict="user_email,date"
                     ).execute()
                 except Exception as e2:
-                    print(f"  Error updating daily stats: {e2}")
+                    print(f"  Error updating daily stats for {date_str}: {e2}")
             else:
-                print(f"  Error updating daily stats: {e}")
+                print(f"  Error updating daily stats for {date_str}: {e}")
+
+
+def recompute_all_daily_stats(user_email: Optional[str] = None) -> int:
+    """
+    One-time data repair: walk every (user_email, date) row in daily_stats and
+    rebuild it from the authoritative tables. Fixes any historical corruption
+    caused by the pre-fix update_daily_stats overwriting older days with
+    sparse-sample counts.
+
+    Returns the number of rows rewritten.
+    """
+    supabase = get_supabase()
+
+    # Find all (user_email, date) pairs to recompute.
+    print("Loading existing daily_stats rows...")
+    all_rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        q = supabase.table("daily_stats").select("user_email, date, emails_sent")
+        if user_email:
+            q = q.eq("user_email", user_email)
+        page = q.range(offset, offset + page_size - 1).execute()
+        if not page.data:
+            break
+        all_rows.extend(page.data)
+        if len(page.data) < page_size:
+            break
+        offset += page_size
+
+    print(f"Found {len(all_rows)} daily_stats rows to recompute.")
+
+    # Cache excluded keys per user (one fetch per user, not per row).
+    excluded_cache: dict = {}
+    rewritten = 0
+
+    for i, row in enumerate(all_rows, 1):
+        ue = row["user_email"]
+        date_str = row["date"]
+
+        if ue not in excluded_cache:
+            excluded_cache[ue] = _get_excluded_keys_for_user(supabase, ue)
+        excluded_keys = excluded_cache[ue]
+
+        stats = _compute_authoritative_daily_stats(supabase, ue, date_str, excluded_keys)
+        # Preserve the existing emails_sent (we have no authoritative source).
+        stats["emails_sent"] = row.get("emails_sent") or 0
+
+        try:
+            supabase.table("daily_stats").upsert(
+                stats, on_conflict="user_email,date"
+            ).execute()
+            rewritten += 1
+        except Exception as e:
+            if "avg_adjusted_hours" in str(e) or "median_adjusted_hours" in str(e):
+                stats.pop("avg_adjusted_hours", None)
+                stats.pop("median_adjusted_hours", None)
+                try:
+                    supabase.table("daily_stats").upsert(
+                        stats, on_conflict="user_email,date"
+                    ).execute()
+                    rewritten += 1
+                except Exception as e2:
+                    print(f"  Error recomputing {ue} {date_str}: {e2}")
+            else:
+                print(f"  Error recomputing {ue} {date_str}: {e}")
+
+        if i % 50 == 0:
+            print(f"  Recomputed {i}/{len(all_rows)} rows...")
+
+    print(f"Recompute complete. Rewrote {rewritten}/{len(all_rows)} rows.")
+    return rewritten
 
 
 def get_tracked_users() -> list:
@@ -763,7 +965,28 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch email response times and store in Supabase")
     parser.add_argument("--user", help="Run for a specific user email only")
     parser.add_argument("--backfill", action="store_true", help="Fetch more history (2000 threads instead of 500)")
+    parser.add_argument(
+        "--recompute-stats",
+        action="store_true",
+        help=(
+            "Don't fetch from Gmail. Walk every existing daily_stats row and "
+            "rebuild it from received_emails and response_pairs. Use this once "
+            "after upgrading to repair historical counts that were corrupted by "
+            "the pre-fix update_daily_stats overwrite logic. Combine with --user "
+            "to limit the recompute to a single user."
+        ),
+    )
     args = parser.parse_args()
+
+    # --recompute-stats is a pure data-repair mode; no Gmail fetch happens.
+    if args.recompute_stats:
+        print("=" * 60)
+        print("Lumiere Email Tracker - Recompute daily_stats from authoritative tables")
+        print("=" * 60)
+        print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        recompute_all_daily_stats(user_email=args.user)
+        print(f"Finished at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        return
 
     max_threads = MAX_THREADS_BACKFILL if args.backfill else MAX_THREADS_DEFAULT
 
