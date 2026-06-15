@@ -26,6 +26,14 @@ on:
         options:
           - 'false'
           - 'true'
+      debug:
+        description: 'Print threads where user sent but no pair was found (use with a specific user_email)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   sync:
@@ -66,5 +74,8 @@ jobs:
           fi
           if [ "${{ github.event.inputs.recompute_stats }}" == "true" ]; then
             ARGS="$ARGS --recompute-stats"
+          fi
+          if [ "${{ github.event.inputs.debug }}" == "true" ]; then
+            ARGS="$ARGS --debug"
           fi
           python tracker_supabase.py $ARGS
