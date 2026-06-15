@@ -658,6 +658,58 @@ def get_received_emails(user_email: str, start_date: date, end_date: date, limit
     return df
 
 
+def get_hourly_distribution(user_email: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Fetch received emails and return count by hour of day (0-23) in user's local timezone."""
+    supabase = get_supabase()
+    work_settings = get_user_work_settings(user_email)
+    user_tz = ZoneInfo(work_settings.get("timezone", "America/New_York"))
+
+    all_data = []
+    batch_size = 1000
+    offset = 0
+    while True:
+        result = supabase.table("received_emails").select(
+            "received_at"
+        ).eq(
+            "user_email", user_email
+        ).gte(
+            "received_at", start_date.isoformat()
+        ).lte(
+            "received_at", end_date.isoformat() + "T23:59:59"
+        ).range(offset, offset + batch_size - 1).execute()
+
+        if not result.data:
+            break
+        all_data.extend(result.data)
+        if len(result.data) < batch_size:
+            break
+        offset += batch_size
+
+    if not all_data:
+        return pd.DataFrame()
+
+    hours = []
+    for row in all_data:
+        try:
+            dt = datetime.fromisoformat(row["received_at"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            local_dt = dt.astimezone(user_tz)
+            hours.append(local_dt.hour)
+        except Exception:
+            pass
+
+    if not hours:
+        return pd.DataFrame()
+
+    counts = pd.Series(hours).value_counts().reindex(range(24), fill_value=0).reset_index()
+    counts.columns = ["Hour", "Emails Received"]
+    counts["Hour Label"] = counts["Hour"].apply(
+        lambda h: f"{h % 12 or 12}{'am' if h < 12 else 'pm'}"
+    )
+    return counts
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_received_emails_stats(user_email: str, start_date: date, end_date: date) -> dict:
     """
@@ -1606,6 +1658,39 @@ with tab_dashboard:
             )
         else:
             st.info("No received email data yet. Data will appear after the next sync.")
+
+    # Hour-of-day distribution chart (shown for each individual)
+    if selected_individual != "All Individuals":
+        st.divider()
+        st.subheader("Emails Received by Hour of Day")
+        work_settings_for_tz = get_user_work_settings(selected_individual)
+        st.caption(f"All external emails received in the selected date range, grouped by local hour ({work_settings_for_tz.get('timezone', 'America/New_York')})")
+
+        hourly_df = get_hourly_distribution(selected_individual, start_date, end_date)
+        if not hourly_df.empty:
+            fig_hourly = go.Figure(go.Bar(
+                x=hourly_df["Hour"],
+                y=hourly_df["Emails Received"],
+                text=hourly_df["Emails Received"],
+                textposition="outside",
+                marker_color="#636EFA",
+                hovertemplate="<b>%{customdata}</b><br>%{y} emails<extra></extra>",
+                customdata=hourly_df["Hour Label"],
+            ))
+            fig_hourly.update_layout(
+                xaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(24)),
+                    ticktext=hourly_df["Hour Label"].tolist(),
+                    title="Hour of Day",
+                ),
+                yaxis_title="Emails Received",
+                showlegend=False,
+                height=350,
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True)
+        else:
+            st.info("No received email data available for the selected date range.")
 
     # Understanding metrics at the bottom
     st.divider()
