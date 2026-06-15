@@ -59,35 +59,16 @@ DEFAULT_INTERNAL_DOMAINS = [
     'wallstreetguide.net',
 ]
 
-# Will be populated from tracked_users table
-_internal_domains = None
-
-
-def get_internal_domains() -> list:
-    """Fetch internal domains from tracked_users table, with caching."""
-    global _internal_domains
-    if _internal_domains is not None:
-        return _internal_domains
-
-    try:
-        supabase = get_supabase()
-        result = supabase.table("tracked_users").select("domain").execute()
-        if result.data:
-            # Get unique domains from tracked users
-            domains = set(row["domain"] for row in result.data if row.get("domain"))
-            # Combine with defaults to ensure we don't miss any
-            _internal_domains = list(domains.union(set(DEFAULT_INTERNAL_DOMAINS)))
-        else:
-            _internal_domains = DEFAULT_INTERNAL_DOMAINS
-    except Exception:
-        _internal_domains = DEFAULT_INTERNAL_DOMAINS
-
-    return _internal_domains
-
 
 def is_internal_email(email: str) -> bool:
-    """Check if an email is from an internal domain."""
-    return any(domain in email for domain in get_internal_domains())
+    """Check if an email is from an internal domain using exact domain matching."""
+    if "@" not in email:
+        return False
+    email_domain = email.split("@")[1].lower()
+    return any(
+        email_domain == domain or email_domain.endswith("." + domain)
+        for domain in DEFAULT_INTERNAL_DOMAINS
+    )
 
 
 def get_user_work_settings(user_email: str) -> dict:
