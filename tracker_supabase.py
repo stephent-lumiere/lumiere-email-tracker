@@ -287,8 +287,8 @@ def extract_body_preview(message: dict, max_chars: int = 1000) -> str:
     return snippet[:max_chars]
 
 
-def process_thread(thread_data: dict, user_email: str, work_settings: dict = None, ooo_dates: set = None) -> dict:
-    """Extract ALL external→user response pairs from a thread, plus email counts."""
+def process_thread(thread_data: dict, user_email: str, work_settings: dict = None, ooo_dates: set = None, debug: bool = False) -> dict:
+    """Extract ALL external-to-user response pairs from a thread, plus email counts."""
     msgs = thread_data.get("messages", [])
 
     result = {"pairs": [], "received": [], "sent": [], "received_emails": []}
@@ -307,10 +307,9 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
     for m in msgs:
         h = {x["name"]: x["value"] for x in m.get("payload", {}).get("headers", [])}
         sender = h.get("From", "")
-        email = sender.split("<")[1].split(">")[0].lower() if "<" in sender else sender.lower()
+        email = sender.split("<")[1].split(">")[0].lower().strip() if "<" in sender else sender.lower().strip()
         try:
             date = parsedate_to_datetime(h.get("Date", ""))
-            # Ensure timezone-aware (some emails have naive datetimes)
             if date.tzinfo is None:
                 date = date.replace(tzinfo=timezone.utc)
         except:
@@ -331,7 +330,6 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
             result["sent"].append(date_str)
         elif not is_noise and not is_internal_email(m["email"]):
             result["received"].append(date_str)
-            # Build a received_email record (replied info backfilled after pairs loop)
             body_preview = extract_body_preview(m.get("raw_msg", {}))
             result["received_emails"].append({
                 "user_email": user_email,
@@ -345,7 +343,7 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                 "body_preview": body_preview,
             })
 
-    # Find ALL external→user pairs (need at least 2 messages)
+    # Find ALL external-to-user pairs (need at least 2 messages)
     if len(parsed) < 2:
         return result
 
@@ -358,7 +356,6 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                 if parsed[j]["email"] == user_email_lower:
                     hours = (parsed[j]["date"] - m["date"]).total_seconds() / 3600
 
-                    # Calculate adjusted hours if work settings provided
                     adjusted_hours = None
                     if work_settings:
                         adjusted_hours = calculate_adjusted_hours(
@@ -381,6 +378,22 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
                     })
                     break  # Only first reply to each external message
 
+    # Debug: for threads where the user sent but no pairs were found, print why
+    if debug:
+        has_user_sent = any(m["email"] == user_email_lower for m in parsed)
+        if has_user_sent and not result["pairs"]:
+            print(f"  [DEBUG no-pair] '{subject[:60]}'")
+            for m in parsed:
+                is_ext = not is_internal_email(m["email"])
+                is_noise = any(ex in m["email"] for ex in EXCLUDE)
+                if m["email"] == user_email_lower:
+                    tag = "USER"
+                elif is_ext and not is_noise:
+                    tag = "EXTERNAL"
+                else:
+                    tag = f"internal/noise"
+                print(f"    {m['date'].strftime('%m-%d %H:%M')} [{tag}] {m['email']}")
+
     # Backfill replied info into received_emails from pairs
     reply_lookup = {}
     for p in result["pairs"]:
@@ -398,7 +411,7 @@ def process_thread(thread_data: dict, user_email: str, work_settings: dict = Non
     return result
 
 
-def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT) -> dict:
+def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT, debug: bool = False) -> dict:
     """Fetch all response pairs for a user."""
     print(f"\n{'='*60}")
     print(f"Processing: {user_email}")
@@ -469,7 +482,7 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     all_received_emails = []
 
     for data in thread_data:
-        result = process_thread(data, user_email, work_settings, ooo_dates)
+        result = process_thread(data, user_email, work_settings, ooo_dates, debug=debug)
         all_pairs.extend(result["pairs"])
         all_received.extend(result["received"])
         all_sent.extend(result["sent"])
@@ -967,6 +980,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fetch email response times and store in Supabase")
     parser.add_argument("--user", help="Run for a specific user email only")
     parser.add_argument("--backfill", action="store_true", help="Fetch more history (2000 threads instead of 500)")
+    parser.add_argument("--debug", action="store_true", help="Print details for threads where the user sent but no pair was found")
     parser.add_argument(
         "--recompute-stats",
         action="store_true",
@@ -1016,7 +1030,7 @@ def main():
 
     for user_email in users:
         try:
-            result = fetch_user_responses(user_email, max_threads=max_threads)
+            result = fetch_user_responses(user_email, max_threads=max_threads, debug=args.debug)
             pairs = result["pairs"]
             received = result["received"]
             sent = result["sent"]
