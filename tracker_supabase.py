@@ -414,12 +414,12 @@ def fetch_user_responses(user_email: str, max_threads: int = MAX_THREADS_DEFAULT
     print(f"  Fetching thread IDs...")
     all_threads = []
     page_token = None
-    # Fetch threads from the last 90 days. Do NOT filter by internal domains here —
-    # Gmail matches -from: against any message in a thread, so filtering by the
-    # user's own domain would exclude every thread they replied to. Internal/external
-    # filtering is handled per-message in process_thread().
+    # Search for threads where the user sent a message. This targets exactly the
+    # threads we care about (ones they replied to) rather than fetching their
+    # entire mailbox and hitting the thread limit on irrelevant threads.
+    # Date range: 90 days back to match the backfill window.
     after_date = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y/%m/%d")
-    query = f"after:{after_date} -from:mailer-daemon -from:postmaster"
+    query = f"from:{user_email} after:{after_date}"
 
     while len(all_threads) < max_threads:
         try:
