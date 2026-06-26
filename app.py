@@ -848,6 +848,27 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
 
     df['response_time'] = df['display_hours'].apply(format_response_time)
 
+    # Fetch body previews from received_emails keyed by (thread_id, received_at)
+    try:
+        thread_ids = df['thread_id'].tolist()
+        preview_result = supabase.table("received_emails").select(
+            "thread_id, received_at, body_preview"
+        ).in_("thread_id", thread_ids).eq("user_email", user_email).execute()
+        if preview_result.data:
+            preview_map = {
+                (r["thread_id"], r["received_at"]): r.get("body_preview") or ""
+                for r in preview_result.data
+            }
+            df['body_preview'] = df.apply(
+                lambda r: preview_map.get((r["thread_id"], r["raw_received_at"]), ""), axis=1
+            )
+        else:
+            df['body_preview'] = ""
+    except Exception:
+        df['body_preview'] = ""
+
+    df['body_preview'] = df['body_preview'].fillna("").str[:300]
+
     # Truncate long fields
     df['external_sender'] = df['external_sender'].str[:35]
     df['subject'] = df['subject'].str[:40]
@@ -1496,7 +1517,7 @@ with tab_dashboard:
             st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
 
             # Build display dataframe with Select checkbox
-            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'display_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id']].copy()
+            display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'display_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id', 'body_preview']].copy()
             display_pairs.insert(0, 'Select', False)
             display_pairs['Response (hrs)'] = display_pairs['display_hours'].round(1)
 
@@ -1516,10 +1537,11 @@ with tab_dashboard:
                 'received_at': 'Received',
                 'replied_at': 'Replied',
                 'response_time': 'Response Time',
+                'body_preview': 'Email Preview',
             })
 
             edited_df = st.data_editor(
-                display_pairs[['Select', 'Excluded', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time']],
+                display_pairs[['Select', 'Excluded', 'External Sender', 'Subject', 'Received', 'Replied', 'Response (hrs)', 'Response Time', 'Email Preview']],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -1531,8 +1553,9 @@ with tab_dashboard:
                     "Replied": st.column_config.TextColumn("Replied", width="small"),
                     "Response (hrs)": st.column_config.NumberColumn("Response (hrs)", format="%.1f", width="small"),
                     "Response Time": st.column_config.TextColumn("Response Time", width="small"),
+                    "Email Preview": st.column_config.TextColumn("Email Preview", width="large"),
                 },
-                disabled=["Excluded", "External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time"],
+                disabled=["Excluded", "External Sender", "Subject", "Received", "Replied", "Response (hrs)", "Response Time", "Email Preview"],
                 key="response_pairs_editor",
             )
 
