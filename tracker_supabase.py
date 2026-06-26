@@ -57,6 +57,7 @@ DEFAULT_INTERNAL_DOMAINS = [
     'horizoninspires.com',
     'youngfounderslab.org',
     'wallstreetguide.net',
+    'researchscholarprogram.com',
 ]
 
 
