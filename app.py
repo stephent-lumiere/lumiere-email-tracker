@@ -1203,6 +1203,113 @@ with tab_manage:
 
     st.divider()
 
+    st.subheader("Activate / Deactivate Mailbox")
+    st.caption(
+        "Deactivating takes a mailbox off the dashboard — the table, the "
+        "ranking and the team summary — and stops the daily sync collecting "
+        "anything new for it. Nothing already collected is deleted, and it "
+        "can be switched back on at any time."
+    )
+    try:
+        supabase_active = get_supabase()
+        all_users = supabase_active.table("tracked_users").select(
+            "email, display_name, is_active"
+        ).order("email").execute()
+        if all_users.data:
+            active_options = {
+                "{} {} ({})".format(
+                    "\u2705" if u.get("is_active") else "\u274c",
+                    u.get("display_name") or u["email"].split("@")[0],
+                    u["email"],
+                ): u
+                for u in all_users.data
+            }
+            act_col1, act_col2 = st.columns([3, 1])
+            with act_col1:
+                selected_active_label = st.selectbox(
+                    "Select mailbox",
+                    list(active_options.keys()),
+                    key="toggle_active_user",
+                )
+            selected_active_user = active_options[selected_active_label]
+            currently_active = bool(selected_active_user.get("is_active"))
+            with act_col2:
+                st.write("")  # spacing
+                if st.button(
+                    "Deactivate" if currently_active else "Reactivate",
+                    use_container_width=True,
+                    key="toggle_active_btn",
+                ):
+                    supabase_active.table("tracked_users").update(
+                        {"is_active": not currently_active}
+                    ).eq("email", selected_active_user["email"]).execute()
+                    st.success(
+                        "{} is now {}.".format(
+                            selected_active_user["email"],
+                            "inactive" if currently_active else "active",
+                        )
+                    )
+                    st.cache_resource.clear()
+                    _clear_data_caches()
+                    st.rerun()
+        else:
+            st.write("No mailboxes are being tracked yet.")
+    except Exception as e:
+        st.error(f"Error loading mailboxes: {e}")
+
+    st.divider()
+
+    st.subheader("Edit Display Name")
+    st.caption(
+        "Fix a misspelt name, or tidy one with stray spaces in it — a "
+        "trailing space makes the same person look like two different people."
+    )
+    try:
+        supabase_name = get_supabase()
+        name_users = supabase_name.table("tracked_users").select(
+            "email, display_name"
+        ).eq("is_active", True).order("email").execute()
+        if name_users.data:
+            name_options = {
+                "{} ({})".format(
+                    u.get("display_name") or u["email"].split("@")[0], u["email"]
+                ): u
+                for u in name_users.data
+            }
+            name_col1, name_col2, name_col3 = st.columns([2, 2, 1])
+            with name_col1:
+                selected_name_label = st.selectbox(
+                    "Select mailbox", list(name_options.keys()), key="edit_name_user"
+                )
+            selected_name_user = name_options[selected_name_label]
+            with name_col2:
+                new_display_name = st.text_input(
+                    "Display name",
+                    value=selected_name_user.get("display_name") or "",
+                    key="edit_name_value",
+                )
+            with name_col3:
+                st.write("")  # spacing
+                if st.button("Update Name", use_container_width=True, key="edit_name_btn"):
+                    # Collapse runs of whitespace and trim the ends.
+                    cleaned = " ".join(new_display_name.split())
+                    if not cleaned:
+                        st.warning("Please enter a name.")
+                    else:
+                        supabase_name.table("tracked_users").update(
+                            {"display_name": cleaned}
+                        ).eq("email", selected_name_user["email"]).execute()
+                        st.success(f"Renamed to {cleaned}.")
+                        st.cache_resource.clear()
+                        _clear_data_caches()
+                        st.rerun()
+        else:
+            st.write("No active mailboxes to rename.")
+    except Exception as e:
+        st.error(f"Error loading mailboxes: {e}")
+
+    st.divider()
+
     st.subheader("Edit User Team")
     st.caption("Change the team assignment for an existing tracked user")
     try:
