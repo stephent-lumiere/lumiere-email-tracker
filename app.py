@@ -659,28 +659,49 @@ def get_daily_trend(user_email: str, start_date: date, end_date: date) -> pd.Dat
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def get_received_emails(user_email: str, start_date: date, end_date: date, limit: int = 50) -> pd.DataFrame:
+def get_received_emails(user_email: str, start_date: date, end_date: date, limit=50) -> pd.DataFrame:
     """
-    Fetch all received emails for a user within a date range.
+    Fetch received emails for a user within a date range, most recent first.
+    Pass limit=None for every email in the window.
     """
     supabase = get_supabase()
 
-    result = supabase.table("received_emails").select(
-        "sender_email, subject, received_at, replied, replied_at, response_hours, body_preview"
-    ).eq(
-        "user_email", user_email
-    ).gte(
-        "received_at", start_date.isoformat()
-    ).lte(
-        "received_at", end_date.isoformat() + "T23:59:59"
-    ).order(
-        "received_at", desc=True
-    ).limit(limit).execute()
+    # Paginated for the same reason as the response pairs table: Supabase
+    # never returns more than 1,000 rows in one response, so .limit() alone
+    # could not reach past that. Ordered on (received_at, id) — id is the
+    # primary key — so pages cannot overlap or skip rows.
+    select_cols = (
+        "sender_email, subject, received_at, replied, replied_at, "
+        "response_hours, body_preview"
+    )
+    rows = []
+    batch_size = 1000
+    offset = 0
+    while limit is None or len(rows) < limit:
+        want = batch_size if limit is None else min(batch_size, limit - len(rows))
+        batch = supabase.table("received_emails").select(
+            select_cols
+        ).eq(
+            "user_email", user_email
+        ).gte(
+            "received_at", start_date.isoformat()
+        ).lte(
+            "received_at", end_date.isoformat() + "T23:59:59"
+        ).order(
+            "received_at", desc=True
+        ).order(
+            "id"
+        ).range(offset, offset + want - 1).execute()
 
-    if not result.data:
+        if not batch.data:
+            break
+        rows.extend(batch.data)
+        offset += len(batch.data)
+
+    if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(result.data)
+    df = pd.DataFrame(rows)
 
     # Format timestamps
     df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
@@ -1941,12 +1962,14 @@ with tab_dashboard:
             st.subheader("Recent Emails Received")
             st.caption(f"External emails received by {selected_individual}")
         with col_recv_limit:
-            num_received = st.selectbox(
+            received_option = st.selectbox(
                 "Show",
-                options=[10, 25, 50, 100],
+                options=[10, 25, 50, 100, "All"],
                 index=1,
                 key="num_received_selector"
             )
+            # None means every email in the window, however many that is.
+            num_received = None if received_option == "All" else received_option
 
         st.caption("Excludes: internal emails (same domain), automated messages (newsletters, notifications, noreply, calendar alerts, Stripe, etc.)")
 
@@ -1964,6 +1987,11 @@ with tab_dashboard:
         received_df = get_received_emails(selected_individual, start_date, end_date, limit=num_received)
 
         if not received_df.empty:
+            if received_option == "All":
+                st.caption(f"Showing all {len(received_df)} emails received in this window")
+            else:
+                st.caption(f"Showing the {len(received_df)} most recent emails received")
+
             display_received = received_df[['sender_email', 'subject', 'received_at', 'replied', 'response_time', 'body_preview']].copy()
             display_received.columns = ['From', 'Subject', 'Received', 'Replied', 'Response Time', 'Email Preview']
             st.dataframe(
