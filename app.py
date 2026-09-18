@@ -807,29 +807,51 @@ def get_received_emails_stats(user_email: str, start_date: date, end_date: date)
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit: int = 10, use_adjusted: bool = False) -> pd.DataFrame:
+def get_recent_response_pairs(user_email: str, start_date: date, end_date: date, limit=10, use_adjusted: bool = False) -> pd.DataFrame:
     """
-    Fetch the most recent response pairs for a specific user within a date range.
+    Fetch response pairs for a specific user within a date range, most recent
+    first. Pass limit=None for every pair in the window.
+
     Includes thread_id and exclusion status for the exclude/restore UI.
     """
     supabase = get_supabase()
 
-    result = supabase.table("response_pairs").select(
-        "thread_id, user_email, external_sender, subject, received_at, replied_at, response_hours, adjusted_response_hours"
-    ).eq(
-        "user_email", user_email
-    ).gte(
-        "replied_at", start_date.isoformat()
-    ).lte(
-        "replied_at", end_date.isoformat() + "T23:59:59"
-    ).order(
-        "replied_at", desc=True
-    ).limit(limit).execute()
+    # Supabase caps any single response at 1,000 rows, so .limit() on its own
+    # could never return more than that — picking "All" silently stopped at
+    # 1,000 pairs. Page through instead, ordered on (replied_at, thread_id) so
+    # pages cannot overlap or skip rows.
+    select_cols = (
+        "thread_id, user_email, external_sender, subject, received_at, "
+        "replied_at, response_hours, adjusted_response_hours"
+    )
+    rows = []
+    batch_size = 1000
+    offset = 0
+    while limit is None or len(rows) < limit:
+        want = batch_size if limit is None else min(batch_size, limit - len(rows))
+        batch = supabase.table("response_pairs").select(
+            select_cols
+        ).eq(
+            "user_email", user_email
+        ).gte(
+            "replied_at", start_date.isoformat()
+        ).lte(
+            "replied_at", end_date.isoformat() + "T23:59:59"
+        ).order(
+            "replied_at", desc=True
+        ).order(
+            "thread_id"
+        ).range(offset, offset + want - 1).execute()
 
-    if not result.data:
+        if not batch.data:
+            break
+        rows.extend(batch.data)
+        offset += len(batch.data)
+
+    if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(result.data)
+    df = pd.DataFrame(rows)
 
     # Keep raw timestamps for exclusion logic and adjusted recalculation
     df['raw_replied_at'] = df['replied_at']
@@ -1640,11 +1662,37 @@ with tab_dashboard:
 
     col5, col6, col7 = st.columns(3)
     with col5:
-        st.metric("Responses Tracked", f"{int(df_filtered['Responses Tracked'].sum())}")
+        st.metric(
+            "Responses Tracked",
+            f"{int(df_filtered['Responses Tracked'].sum())}",
+            help="One email from outside the company, followed by this "
+                 "mailbox's first reply to it in the same thread. Only the "
+                 "first reply counts. Response times are calculated from "
+                 "these and nothing else — a reply to a colleague is not one. "
+                 "Pairs you have excluded, and anything over 5 days while "
+                 "that filter is on, are not counted here.",
+        )
     with col6:
-        st.metric("Emails Received", f"{int(df_filtered['Emails Received'].sum())}")
+        st.metric(
+            "Emails Received",
+            f"{int(df_filtered['Emails Received'].sum())}",
+            help="Messages from outside the company, counted per message "
+                 "rather than per conversation. Colleagues on company domains "
+                 "and automated senders are left out. Important: only "
+                 "messages in threads this mailbox has sent in are counted, "
+                 "so an email nobody ever replied to usually is not. Treat "
+                 "this as external conversation volume, not inbox volume.",
+        )
     with col7:
-        st.metric("Emails Sent", f"{int(df_filtered['Emails Sent'].sum())}")
+        st.metric(
+            "Emails Sent",
+            f"{int(df_filtered['Emails Sent'].sum())}",
+            help="Every message this mailbox sent in the threads the tracker "
+                 "looked at — including replies to colleagues and internal "
+                 "threads. Nothing is filtered out, which is why this is much "
+                 "larger than Emails Received. It also never goes down, "
+                 "because there is no source to recount it from.",
+        )
 
     st.divider()
 
@@ -1665,11 +1713,37 @@ with tab_dashboard:
             "Email": st.column_config.TextColumn("Email", width="large"),
             "Domain": st.column_config.TextColumn("Domain", width="medium"),
             "Team": st.column_config.TextColumn("Team", width="small"),
-            "Median Response (hrs)": st.column_config.NumberColumn("Median (hrs)", format="%.1f"),
-            "Avg Response (hrs)": st.column_config.NumberColumn("Avg (hrs)", format="%.1f"),
-            "Responses Tracked": st.column_config.NumberColumn("Responses", format="%d"),
-            "Emails Received": st.column_config.NumberColumn("Received", format="%d"),
-            "Emails Sent": st.column_config.NumberColumn("Sent", format="%d"),
+            "Median Response (hrs)": st.column_config.NumberColumn(
+                "Median (hrs)", format="%.1f",
+                help="The middle response time for this mailbox — half its "
+                     "replies were faster, half slower. Less affected by one "
+                     "very slow reply than the average is.",
+            ),
+            "Avg Response (hrs)": st.column_config.NumberColumn(
+                "Avg (hrs)", format="%.1f",
+                help="The mean response time for this mailbox. A handful of "
+                     "very slow replies pull this up, so it usually reads "
+                     "higher than the median.",
+            ),
+            "Responses Tracked": st.column_config.NumberColumn(
+                "Responses", format="%d",
+                help="External emails this mailbox replied to — one per "
+                     "incoming email, counting only the first reply. The "
+                     "median and average are calculated from exactly these.",
+            ),
+            "Emails Received": st.column_config.NumberColumn(
+                "Received", format="%d",
+                help="Messages from outside the company, per message. "
+                     "Colleagues and automated senders excluded, and only "
+                     "within conversations this mailbox sent in — so it is "
+                     "not inbox volume.",
+            ),
+            "Emails Sent": st.column_config.NumberColumn(
+                "Sent", format="%d",
+                help="Everything this mailbox sent in those conversations, "
+                     "internal replies included and nothing filtered out — "
+                     "which is why it dwarfs Received.",
+            ),
         }
     )
 
@@ -1731,12 +1805,16 @@ with tab_dashboard:
                 index=0,
                 key="num_pairs_selector"
             )
-            num_pairs = 10000 if pairs_option == "All" else pairs_option
+            # None means every pair in the window, however many that is.
+            num_pairs = None if pairs_option == "All" else pairs_option
 
         recent_pairs = get_recent_response_pairs(selected_individual, start_date, end_date, limit=num_pairs, use_adjusted=use_adjusted)
 
         if not recent_pairs.empty:
-            st.caption(f"Showing {len(recent_pairs)} most recent response pairs")
+            if pairs_option == "All":
+                st.caption(f"Showing all {len(recent_pairs)} response pairs in this window")
+            else:
+                st.caption(f"Showing the {len(recent_pairs)} most recent response pairs")
 
             # Build display dataframe with Select checkbox
             display_pairs = recent_pairs[['external_sender', 'subject', 'received_at', 'replied_at', 'response_hours', 'display_hours', 'response_time', 'excluded', 'thread_id', 'raw_replied_at', 'user_email', 'excluded_id', 'whitelisted', 'whitelisted_id', 'body_preview']].copy()
@@ -1943,9 +2021,15 @@ with tab_dashboard:
         st.markdown("""
         - **Median Response Time**: The middle value of all response times - half of responses are faster, half are slower. Best indicator of typical behavior.
         - **Avg Response Time**: Mean time to respond to external emails. Can be skewed by a few very slow responses.
-        - **Responses Tracked**: The number of external email → user reply pairs found. **This is what response time calculations are based on.** Each time an external person emails and the user replies, that's one tracked response.
-        - **Emails Received**: External emails received (excludes internal @lumiere.education emails and automated messages).
-        - **Emails Sent**: Emails sent by this user in tracked threads.
+        **The three counts, and why they differ so much**
+
+        They are not three views of the same thing. Each counts something different, so they will never line up.
+
+        - **Responses Tracked**: one email from outside the company, followed by this mailbox's *first* reply to it in the same conversation. Only the first reply counts — a long back-and-forth is not ten responses. **Response times are calculated from these and nothing else.** A reply to a colleague is not a tracked response. Pairs you have excluded, and anything over 5 days while that filter is on, are not counted.
+        - **Emails Received**: messages from outside the company, counted one per message rather than one per conversation. Colleagues on company domains and automated senders (no-reply addresses, newsletters, delivery failures, calendar and payment notifications) are left out. **This is not inbox volume.** The tracker only looks at conversations this mailbox has itself sent a message in, so an email that was never replied to is usually not counted at all. Read it as external conversation volume.
+        - **Emails Sent**: every message this mailbox sent in the conversations the tracker looked at — replies to colleagues and internal threads included. Nothing is filtered out. That is the whole reason this number is several times larger than Emails Received: Received strips out internal and automated mail, Sent strips out nothing. It also never decreases, because there is no authoritative source to recount it from.
+
+        So a mailbox can show a high Sent count and a low Received count simply by working mostly with colleagues, and neither number says anything about how fast it replies — only Responses Tracked feeds that.
 
         **Excluded Response Pairs**
 
