@@ -359,27 +359,51 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
     """
     import time
 
-    # Retry logic for transient network errors
-    result = None
-    for attempt in range(3):
-        try:
-            supabase = get_supabase()
-            result = supabase.table("daily_stats").select("*").gte(
-                "date", start_date.isoformat()
-            ).lte(
-                "date", end_date.isoformat()
-            ).execute()
-            break
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(1)
-                continue
-            raise e
+    # daily_stats MUST be paginated. Supabase caps any single response at a
+    # fixed number of rows (1,000 by default), and this table holds one row
+    # per tracked mailbox per day — with ~80 mailboxes that is only about
+    # twelve days of data. A single unpaginated request therefore stopped
+    # dead at the cap, so every window longer than ~12 days silently lost
+    # rows and the totals stopped growing with the window. Worse, the query
+    # had no ORDER BY, so the 1,000 rows it did get back were an arbitrary
+    # subset — which is why a longer window could report FEWER responses
+    # than a shorter one.
+    #
+    # (date, user_email) is unique, so ordering on both gives a stable total
+    # order and pages that never overlap or skip. We advance by the number of
+    # rows actually returned rather than by the page size we asked for, in
+    # case the server caps a page below our batch size.
+    supabase = get_supabase()
+    stats_rows = []
+    stats_batch_size = 1000
+    stats_offset = 0
+    while True:
+        batch = None
+        for attempt in range(3):
+            try:
+                batch = supabase.table("daily_stats").select("*").gte(
+                    "date", start_date.isoformat()
+                ).lte(
+                    "date", end_date.isoformat()
+                ).order("date").order("user_email").range(
+                    stats_offset, stats_offset + stats_batch_size - 1
+                ).execute()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                raise e
 
-    if not result or not result.data:
+        if not batch or not batch.data:
+            break
+        stats_rows.extend(batch.data)
+        stats_offset += len(batch.data)
+
+    if not stats_rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(result.data)
+    df = pd.DataFrame(stats_rows)
 
     # Aggregate email counts by user (these sums are correct from daily_stats).
     aggregated = df.groupby("user_email").agg({
@@ -407,14 +431,16 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
                 "replied_at", start_date.isoformat()
             ).lte(
                 "replied_at", end_date.isoformat() + "T23:59:59"
-            ).range(offset, offset + batch_size - 1).execute()
+            ).order("id").range(offset, offset + batch_size - 1).execute()
 
             if not pairs_batch.data:
                 break
             all_pairs_data.extend(pairs_batch.data)
-            if len(pairs_batch.data) < batch_size:
-                break
-            offset += batch_size
+            # Advance by what the server actually returned, not by the page
+            # size we asked for — Supabase can cap a response below the
+            # requested range, and assuming a full page silently dropped
+            # everything past the cap.
+            offset += len(pairs_batch.data)
     except Exception as e:
         print(f"Error fetching response_pairs: {e}")
         all_pairs_data = []
@@ -514,17 +540,40 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         pairs_df = pairs_df.drop(columns=["_replied_at_norm"], errors="ignore")
 
         # True per-user mean and median from the raw response_hours values.
-        user_stats = pairs_df.groupby("user_email")[hours_col].agg(["mean", "median"]).reset_index()
-        user_stats.columns = ["user_email", "avg_response_hours", "median_response_hours"]
+        user_stats = pairs_df.groupby("user_email")[hours_col].agg(
+            ["mean", "median", "count"]
+        ).reset_index()
+        user_stats.columns = [
+            "user_email", "avg_response_hours", "median_response_hours", "counted_pairs",
+        ]
         aggregated = aggregated.merge(user_stats, on="user_email", how="left")
+
+        # "Responses Tracked" must describe the SAME set of responses the mean
+        # and median were computed from, i.e. after excluded pairs, unusable
+        # hours and the >5-day filter have been removed. daily_stats holds the
+        # raw pre-filter count, so using it here made the count disagree with
+        # the averages sitting next to it.
+        aggregated["response_pairs_count"] = (
+            aggregated["counted_pairs"].fillna(0).astype(int)
+        )
+        aggregated = aggregated.drop(columns=["counted_pairs"])
+
+        # Carry each user's individual response times through as a hidden
+        # column. The summary tiles need them to work out a true median across
+        # every response, which cannot be recovered from per-user medians.
+        hours_lists = pairs_df.groupby("user_email")[hours_col].apply(list).reset_index()
+        hours_lists.columns = ["user_email", "_hours"]
+        aggregated = aggregated.merge(hours_lists, on="user_email", how="left")
     else:
         aggregated["avg_response_hours"] = None
         aggregated["median_response_hours"] = None
+        aggregated["response_pairs_count"] = 0
+        aggregated["_hours"] = None
 
     # Fetch user info (domain, display_name, team_function) once.
     try:
         users_result = supabase.table("tracked_users").select(
-            "email, domain, display_name, team_function"
+            "email, domain, display_name, team_function, is_active"
         ).execute()
     except Exception:
         users_result = None
@@ -534,6 +583,14 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         aggregated = aggregated.merge(
             users_df, left_on="user_email", right_on="email", how="left"
         )
+
+        # Show only mailboxes that are still being tracked. Without this,
+        # anyone switched off in Manage Team carried on appearing in the
+        # table, the ranking and the team summary for as long as they had
+        # daily_stats rows. .ne(False) keeps rows whose is_active is missing.
+        if "is_active" in aggregated.columns:
+            aggregated = aggregated[aggregated["is_active"].ne(False)]
+            aggregated = aggregated.drop(columns=["is_active"])
 
     # Vectorized fallbacks for missing user info — one ufunc each, no
     # apply(axis=1).
@@ -572,6 +629,7 @@ def get_stats_from_supabase(start_date: date, end_date: date, use_adjusted: bool
         "Name", "Email", "Domain", "Team",
         "Median Response (hrs)", "Avg Response (hrs)",
         "Responses Tracked", "Emails Received", "Emails Sent",
+        "_hours",
     ]
     column_order = [c for c in column_order if c in aggregated.columns]
     aggregated = aggregated[column_order]
@@ -1425,16 +1483,60 @@ with tab_dashboard:
     st.subheader(f"Summary: {filter_label}")
     st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')} ({len(df_filtered)} people)")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # Two ways of reading the same data, shown side by side because they
+    # answer different questions:
+    #   "per person"     — every mailbox counts equally, however many emails
+    #                      it handled. Good for "how is the team doing?"
+    #   "all responses"  — every response counts equally, so busy mailboxes
+    #                      carry more weight. This is the true median.
+    # The tiles used to show only the per-person figures, labelled simply
+    # "Median Response", which read as if they were true medians.
+    pooled_hours = []
+    if "_hours" in df_filtered.columns:
+        for entry in df_filtered["_hours"]:
+            if isinstance(entry, list):
+                pooled_hours.extend(entry)
+    pooled = pd.Series(pooled_hours, dtype="float64")
+
+    def _hrs(value):
+        return f"{value:.1f} hrs" if pd.notna(value) else "—"
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Median Response", f"{df_filtered['Median Response (hrs)'].mean():.1f} hrs")
+        st.metric(
+            "Median Response (per person)",
+            _hrs(df_filtered['Median Response (hrs)'].mean()),
+            help="The average of each mailbox's own median. Every mailbox "
+                 "counts equally, however many emails it handled.",
+        )
     with col2:
-        st.metric("Avg Response", f"{df_filtered['Avg Response (hrs)'].mean():.1f} hrs")
+        st.metric(
+            "Median Response (all responses)",
+            _hrs(pooled.median() if not pooled.empty else None),
+            help="The true median across every individual response in the "
+                 "window. Busier mailboxes carry more weight.",
+        )
     with col3:
-        st.metric("Responses Tracked", f"{int(df_filtered['Responses Tracked'].sum())}")
+        st.metric(
+            "Avg Response (per person)",
+            _hrs(df_filtered['Avg Response (hrs)'].mean()),
+            help="The average of each mailbox's own average. Every mailbox "
+                 "counts equally.",
+        )
     with col4:
-        st.metric("Emails Received", f"{int(df_filtered['Emails Received'].sum())}")
+        st.metric(
+            "Avg Response (all responses)",
+            _hrs(pooled.mean() if not pooled.empty else None),
+            help="The true average across every individual response in the "
+                 "window.",
+        )
+
+    col5, col6, col7 = st.columns(3)
     with col5:
+        st.metric("Responses Tracked", f"{int(df_filtered['Responses Tracked'].sum())}")
+    with col6:
+        st.metric("Emails Received", f"{int(df_filtered['Emails Received'].sum())}")
+    with col7:
         st.metric("Emails Sent", f"{int(df_filtered['Emails Sent'].sum())}")
 
     st.divider()
@@ -1469,7 +1571,13 @@ with tab_dashboard:
         st.divider()
         st.subheader("Response Time Ranking")
 
-        df_sorted = df_filtered.sort_values('Median Response (hrs)')
+        # People with no usable responses in the window have no median. They
+        # were previously plotted as "nanh" bars coloured red, which reads as
+        # the slowest responders when in fact they had nothing to respond to.
+        df_sorted = df_filtered.dropna(
+            subset=['Median Response (hrs)']
+        ).sort_values('Median Response (hrs)')
+        no_median_count = len(df_filtered) - len(df_sorted)
 
         fig_ranking = go.Figure()
 
@@ -1488,11 +1596,18 @@ with tab_dashboard:
         fig_ranking.update_layout(
             xaxis_title='Median Response Time (hours)',
             yaxis_title='',
-            height=50 + len(df_filtered) * 40,
+            height=50 + len(df_sorted) * 40,
             showlegend=False
         )
 
         st.plotly_chart(fig_ranking, use_container_width=True)
+
+        if no_median_count:
+            noun = "mailbox" if no_median_count == 1 else "mailboxes"
+            st.caption(
+                f"{no_median_count} tracked {noun} had no responses in this "
+                "window, so there is no median to rank — not shown on the chart."
+            )
 
     # Show response pairs when a single individual is selected
     if selected_individual != "All Individuals":
