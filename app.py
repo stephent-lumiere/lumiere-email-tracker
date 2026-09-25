@@ -1053,11 +1053,17 @@ with st.sidebar:
     )
     use_adjusted = response_time_mode == "Working Hours Adjusted"
 
-    # Exclude long responses toggle
+    # Exclude long responses toggle.
+    # Default depends on the mode: Raw Time counts every response (unticked),
+    # Working Hours Adjusted drops anything over 5 working days (ticked).
+    # The key includes the mode, so switching mode resets the box to that
+    # mode's default rather than carrying the other mode's setting across.
     exclude_long_responses = st.checkbox(
         "Exclude responses > 5 days",
-        value=True,
-        help="Filter out response pairs where the reply took more than 5 days (120 hours)"
+        value=use_adjusted,
+        key=f"exclude_long_{'adjusted' if use_adjusted else 'raw'}",
+        help="Filter out response pairs where the reply took more than 5 days (120 hours). "
+             "Off by default in Raw Time so every response counts; on by default in Working Hours Adjusted."
     )
 
     # Explainer for each time window
