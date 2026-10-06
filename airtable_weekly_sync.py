@@ -8,11 +8,16 @@ each time so late-arriving data settles on its own. Safe to re-run: rows
 are matched on "Record Key" (<staff record id>|<week starting>), never
 duplicated.
 
-Figures match the dashboard's Raw Time mode with every response counted:
-  - median / average come from every individual response that week
-    (response_pairs), never from averaging daily medians
+Figures match the dashboard's "Working Hours Adjusted" mode, which is what
+the standards were set against:
+  - each response's time skips weekends (if the person's setting says so)
+    and their out-of-office days, in their own timezone
+  - responses over 5 working days (120h) are dropped unless whitelisted
   - responses excluded in the dashboard are left out
+  - median / average come from every individual response that week,
+    never from averaging daily medians
   - emails sent is the sum of daily_stats for the week
+Only Active people on the Staff Table get a row.
 A person can have two inboxes: their Staff Email, and a second one (e.g. a
 white-label or Horizon inbox) in the Staff Table's "Second Inbox Email"
 field. Each inbox gets its own figures on the same row (the "Second Email"
@@ -46,7 +51,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from supabase import create_client
@@ -58,6 +64,7 @@ METRIC_TABLE = "tblNaK1sQM5LQxu3k"       # Metric Tracking
 F_STAFF_EMAIL = "Staff Email"
 F_STAFF_SECOND = "Second Inbox Email"
 F_STAFF_NAME = "Name"
+F_STAFF_STATUS = "Status"
 
 # Metric Tracking fields written by this script
 F_KEY = "Record Key"
@@ -100,8 +107,13 @@ def _airtable(method, path, token, params=None, body=None):
 
 
 def load_staff(token):
-    """Map each inbox address (lower-case) -> (record id, name, slot 1 or 2)."""
-    by_email = {}
+    """Map each inbox address (lower-case) -> (record id, name, slot 1 or 2).
+
+    Only Active people; records named "Test ..." are ignored. If an address is
+    someone's Second Inbox Email, that wins over another record that has the
+    same address as its Staff Email (e.g. a separate white-label record).
+    """
+    second, first, conflicts = {}, {}, []
     offset = None
     while True:
         params = {"pageSize": 100}
@@ -110,15 +122,27 @@ def load_staff(token):
         page = _airtable("GET", f"{BASE_ID}/{STAFF_TABLE}", token, params=params)
         for rec in page.get("records", []):
             f = rec.get("fields", {})
-            name = f.get(F_STAFF_NAME) or rec["id"]
-            for slot, field in ((1, F_STAFF_EMAIL), (2, F_STAFF_SECOND)):
+            if str(f.get(F_STAFF_STATUS) or "").strip().lower() != "active":
+                continue
+            name = str(f.get(F_STAFF_NAME) or rec["id"]).strip()
+            if name.lower().startswith("test"):
+                continue
+            for slot, field, target in ((1, F_STAFF_EMAIL, first), (2, F_STAFF_SECOND, second)):
                 e = str(f.get(field) or "").strip().lower()
-                if e:
-                    by_email.setdefault(e, (rec["id"], name, slot))
+                if not e:
+                    continue
+                if e in target and target[e][0] != rec["id"]:
+                    conflicts.append(f"{e}: {target[e][1]} / {name}")
+                    continue
+                target[e] = (rec["id"], name, slot)
         offset = page.get("offset")
         if not offset:
             break
         time.sleep(0.25)
+    by_email = dict(first)
+    by_email.update(second)
+    for c in conflicts:
+        print("Same inbox on two Active Staff records (first one used):", c)
     return by_email
 
 
@@ -182,34 +206,104 @@ def _paged(query_fn):
     return rows
 
 
-def week_figures(sb, start, end):
+def adjusted_hours(received_at, replied_at, tz_name, exclude_weekends, ooo_dates):
+    """Same rule as the dashboard's Working Hours Adjusted mode."""
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    recv, repl = received_at.astimezone(tz), replied_at.astimezone(tz)
+    total, day = 0.0, recv.date()
+    while day <= repl.date():
+        if (exclude_weekends and day.weekday() >= 5) or day in ooo_dates:
+            day += timedelta(days=1)
+            continue
+        start = datetime.combine(day, dt_time(0, 0), tzinfo=tz)
+        end = start + timedelta(days=1)
+        if day == recv.date():
+            start = max(start, recv)
+        if day == repl.date():
+            end = min(end, repl)
+        if end > start:
+            total += (end - start).total_seconds()
+        day += timedelta(days=1)
+    return total / 3600
+
+
+def _ts(value):
+    dt = datetime.fromisoformat(str(value))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def load_settings(sb):
+    """Per-mailbox timezone, weekend setting and out-of-office dates."""
+    settings = {}
+    for u in sb.table("tracked_users").select("email, timezone, exclude_weekends").execute().data or []:
+        settings[u["email"].lower()] = {
+            "tz": u.get("timezone") or "America/New_York",
+            # same as the dashboard: missing -> True, empty -> False
+            "weekends": bool(u.get("exclude_weekends", True)),
+            "ooo": set(),
+        }
+    try:
+        rows = _paged(lambda: sb.table("user_out_of_office")
+                      .select("user_email, start_date, end_date").order("user_email"))
+    except Exception:
+        rows = []
+    for r in rows:
+        st = settings.setdefault(r["user_email"].lower(),
+                                 {"tz": "America/New_York", "weekends": True, "ooo": set()})
+        d = datetime.fromisoformat(r["start_date"]).date()
+        end = datetime.fromisoformat(r["end_date"]).date()
+        while d <= end:
+            st["ooo"].add(d)
+            d += timedelta(days=1)
+    return settings
+
+
+def week_figures(sb, start, end, settings):
     """Per-mailbox figures for start..end (inclusive dates, UTC)."""
     s, e = start.isoformat(), end.isoformat() + "T23:59:59"
 
     stats = _paged(lambda: sb.table("daily_stats").select("user_email, date, emails_sent")
                    .gte("date", start.isoformat()).lte("date", end.isoformat())
                    .order("date").order("user_email"))
-    pairs = _paged(lambda: sb.table("response_pairs").select("user_email, thread_id, replied_at, response_hours")
+    pairs = _paged(lambda: sb.table("response_pairs")
+                   .select("user_email, thread_id, received_at, replied_at, response_hours")
                    .gte("replied_at", s).lte("replied_at", e).order("id"))
-    try:
-        excluded = sb.table("excluded_response_pairs").select("thread_id, replied_at") \
-            .gte("replied_at", s).lte("replied_at", e).execute().data or []
-    except Exception:
-        excluded = []
-    excluded_keys = {(x["thread_id"], _norm_ts(x["replied_at"])) for x in excluded}
+
+    def keys(table):
+        try:
+            rows = sb.table(table).select("thread_id, replied_at") \
+                .gte("replied_at", s).lte("replied_at", e).execute().data or []
+        except Exception:
+            rows = []
+        return {(x["thread_id"], _norm_ts(x["replied_at"])) for x in rows}
+
+    excluded, whitelisted = keys("excluded_response_pairs"), keys("whitelisted_response_pairs")
+    default = {"tz": "America/New_York", "weekends": True, "ooo": set()}
 
     out = {}
     for row in stats:
         m = out.setdefault(row["user_email"].lower(), {"sent": 0, "hours": []})
         m["sent"] += row.get("emails_sent") or 0
     for p in pairs:
-        if (p["thread_id"], _norm_ts(p["replied_at"])) in excluded_keys:
+        key = (p["thread_id"], _norm_ts(p["replied_at"]))
+        if key in excluded:
             continue
+        email = p["user_email"].lower()
+        st = settings.get(email, default)
         try:
-            h = float(p["response_hours"])
-        except (TypeError, ValueError):
+            h = adjusted_hours(_ts(p["received_at"]), _ts(p["replied_at"]),
+                               st["tz"], st["weekends"], st["ooo"])
+        except Exception:
+            try:
+                h = float(p["response_hours"])
+            except (TypeError, ValueError):
+                continue
+        if h > 120 and key not in whitelisted:
             continue
-        out.setdefault(p["user_email"].lower(), {"sent": 0, "hours": []})["hours"].append(h)
+        out.setdefault(email, {"sent": 0, "hours": []})["hours"].append(h)
     return out
 
 
@@ -238,6 +332,7 @@ def main():
               (sb.table("tracked_users").select("email, is_active").execute().data or [])
               if u.get("is_active") is not False}
     staff = load_staff(token)
+    settings = load_settings(sb)
 
     unmatched = set()
     mondays = completed_weeks(args.weeks)
@@ -248,7 +343,7 @@ def main():
         locked = set()
     skipped = 0
     for monday in mondays:
-        figs = week_figures(sb, monday, monday + timedelta(days=6))
+        figs = week_figures(sb, monday, monday + timedelta(days=6), settings)
         people = {}
         for email, m in figs.items():
             if email not in active:
