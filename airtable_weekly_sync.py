@@ -17,7 +17,8 @@ the standards were set against:
   - median / average come from every individual response that week,
     never from averaging daily medians
   - emails sent is the sum of daily_stats for the week
-Only Active people on the Staff Table get a row.
+Only Active people on the Staff Table whose Last Updated Vertical includes
+Lumiere Education or Horizon Academics get a row (VERTICALS below).
 A person can have two inboxes: their Staff Email, and a second one (e.g. a
 white-label or Horizon inbox) in the Staff Table's "Second Inbox Email"
 field. Each inbox gets its own figures on the same row (the "Second Email"
@@ -65,6 +66,8 @@ F_STAFF_EMAIL = "Staff Email"
 F_STAFF_SECOND = "Second Inbox Email"
 F_STAFF_NAME = "Name"
 F_STAFF_STATUS = "Status"
+F_STAFF_VERTICAL = "Last Updated Vertical"
+VERTICALS = ("lumiere education", "horizon academics")  # who gets a row
 
 # Metric Tracking fields written by this script
 F_KEY = "Record Key"
@@ -123,6 +126,9 @@ def load_staff(token):
         for rec in page.get("records", []):
             f = rec.get("fields", {})
             if str(f.get(F_STAFF_STATUS) or "").strip().lower() != "active":
+                continue
+            vertical = str(f.get(F_STAFF_VERTICAL) or "").lower()
+            if not any(v in vertical for v in VERTICALS):
                 continue
             name = str(f.get(F_STAFF_NAME) or rec["id"]).strip()
             if name.lower().startswith("test"):
