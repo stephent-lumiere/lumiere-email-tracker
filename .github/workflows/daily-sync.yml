@@ -26,6 +26,18 @@ on:
         options:
           - 'false'
           - 'true'
+      airtable_weeks:
+        description: 'Completed weeks to write to the Airtable competency table (default 2; use 12 to backfill)'
+        required: false
+        default: '2'
+      airtable_only:
+        description: 'Only write to Airtable (skip the Gmail sync)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
       debug:
         description: 'Print threads where user sent but no pair was found (use with a specific user_email)'
         required: false
@@ -64,6 +76,7 @@ jobs:
           echo "GOOGLE_CREDENTIALS_FILE=credentials.json" >> .env
 
       - name: Run tracker
+        if: github.event.inputs.airtable_only != 'true'
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.user_email }}" ]; then
@@ -79,3 +92,10 @@ jobs:
             ARGS="$ARGS --debug"
           fi
           python tracker_supabase.py $ARGS
+
+      - name: Write weekly figures to Airtable (competency system)
+        if: always()
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_WEEKS: ${{ github.event.inputs.airtable_weeks || '2' }}
+        run: python airtable_weekly_sync.py
