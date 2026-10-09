@@ -8,27 +8,36 @@ ahead for next week). Rows are matched on "Record Key"
 (<staff record id>|<week starting>), the same key the email and Slack syncs
 use, so the figures land on the same weekly row.
 
-Where the numbers come from (Calendly, program.manager organisation):
-  - Interview pools = active pooled event types (round robin / multi-pool) on
-    the token's Calendly account whose name looks like an interview
-    (INTERVIEW_POOL below). New pools are picked up automatically.
-  - Lumiere pools = the "Lumiere Research Scholar Program - Interview" pools
-    (main + Americas). Everything else counts as "Other".
-  - Hours offered = each host's own availability on that pool for each day
-    of the week (their weekly hours, with date overrides taking priority),
-    in the host's timezone. This is what they opened up, before Calendly
-    removes slots that clash with their own calendar.
-  - Booked = Calendly bookings on those pools that week (not cancelled).
-    Taken = booked and already finished, invitee not marked as a no-show.
-    No-show or cancelled = cancelled bookings + invitee no-shows.
-  - Cross-team = hours offered on pools for a vertical that is not one of the
-    person's own verticals (e.g. a Lumiere PM on the Ladder pool).
+Each person's "Interview Team" (Staff Table formula) decides which target
+applies; targets, shortfall and met / not met are Airtable formulas:
+  Lumiere      Lumiere student interviews + any other interviews (separately)
+  White Label  JLI + White Label Research Scholar Program, combined
+  Horizon      HARP only (on the Horizon Calendly account)
+  (blank)      interns: figures written, no target
 
-Targets, shortfall and met / not met are formulas in Airtable, not here.
+Where the numbers come from (Calendly):
+  - Interview pools = active pooled event types (round robin / multi-pool)
+    whose name looks like an interview, on the program.manager account
+    (CALENDLY_TOKEN) and, if set, the Horizon account (HORIZON_CALENDLY_TOKEN).
+    New pools are picked up automatically.
+  - Pool categories: Lumiere student = "Lumiere Research Scholar Program -
+    Interview" (main + Americas); White Label = JLI + "Research Program
+    Interview Slot"; Horizon = every interview pool on the Horizon account;
+    Other = every other interview pool.
+  - Hours offered = each host's own availability on that pool for each day
+    of the week (weekly hours, date overrides taking priority), in the host's
+    timezone - what they opened up, before Calendly removes slots that clash
+    with their own calendar.
+  - Booked = bookings on those pools that week (not cancelled). Taken =
+    booked, already finished, invitee not marked a no-show. No-show or
+    cancelled = cancelled bookings + invitee no-shows.
+  - Cross-team = hours offered on another vertical's pools (e.g. a Lumiere PM
+    on the Ladder pool). Information only; it doesn't affect any target.
 
 Environment:
-  CALENDLY_TOKEN   personal access token from the program.manager account
-  AIRTABLE_TOKEN   personal access token, read/write on the base
+  CALENDLY_TOKEN          personal access token, program.manager account
+  HORIZON_CALENDLY_TOKEN  personal access token, Horizon account (optional)
+  AIRTABLE_TOKEN          personal access token, read/write on the base
 
 Usage:
   python interview_hours_sync.py            # last week, this week, next week
@@ -54,32 +63,34 @@ METRIC_TABLE = "tblNaK1sQM5LQxu3k"       # Metric Tracking
 
 # Staff Table
 S_NAME, S_EMAIL, S_SECOND = "Name", "Staff Email", "Second Inbox Email"
-S_SCOPE, S_VERTICAL = "In Competency Scope", "Last Updated Vertical"
+S_SCOPE, S_TEAM = "In Competency Scope", "Interview Team"
 
 # Metric Tracking fields written here
 F_KEY, F_NAME, F_MEMBER, F_WEEK = "Record Key", "Name", "Team Member", "Week Starting"
 F_LUM = "Interview Hours Offered - Lumiere"
 F_OTH = "Interview Hours Offered - Other"
+F_WL = "Interview Hours Offered - White Label"
+F_HOR = "Interview Hours Offered - Horizon"
 F_CROSS = "Interview Hours - Cross-Team"
 F_BOOKED = "Interviews Booked"
 F_TAKEN = "Interviews Taken"
 F_NOSHOW = "Interviews No-show or Cancelled"
 F_BREAKDOWN = "Interview Hours - Breakdown"
 
-INTERVIEW_POOL = re.compile(r"interview|sign-up|mentorship position", re.I)
+INTERVIEW_POOL = re.compile(r"interview|sign-up|mentorship position|\bharp\b", re.I)
 SKIP_POOL = re.compile(r"uceazy|20(1\d|2[0-3])", re.I)   # old one-off pools (e.g. UCEazy 2022)
 LUMIERE_POOL = re.compile(r"^lumiere (research scholar program|rsp) - interview", re.I)
+WHITE_LABEL_POOL = re.compile(r"^jli\b|^research program interview slot", re.I)
 
-# Which vertical a pool serves, by name (first match wins). Used for cross-team.
+# Which vertical a pool serves (first match wins). Used for cross-team only.
 POOL_VERTICAL = [
     (re.compile(r"ladder|online internship", re.I), "ladder"),
     (re.compile(r"\bwsg\b|wall street", re.I), "wsg"),
     (re.compile(r"young founders|\byfl\b", re.I), "yfl"),
     (re.compile(r"veritas", re.I), "veritas"),
-    (re.compile(r"horizon", re.I), "horizon"),
 ]
-DEFAULT_VERTICAL = "lumiere"   # Lumiere RSP, mentor, Foundation, JLI, professor pools
-PERSON_VERTICALS = {"lumiere education": "lumiere", "horizon academics": "horizon"}
+DEFAULT_VERTICAL = "lumiere"   # Lumiere RSP, mentor, Foundation, professor pools
+TEAM_VERTICAL = {"Lumiere": "lumiere", "White Label": "white label", "Horizon": "horizon"}
 
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -138,7 +149,7 @@ def _norm_name(s):
 
 
 def load_staff(token):
-    """In-scope people: record id -> {name, verticals}; plus email and name lookups."""
+    """In-scope people: record id -> {name, team}; plus email and name lookups."""
     people, by_email, by_name, offset = {}, {}, {}, None
     while True:
         params = {"pageSize": 100, "filterByFormula": f"{{{S_SCOPE}}}=1"}
@@ -148,9 +159,9 @@ def load_staff(token):
         for rec in page.get("records", []):
             f = rec.get("fields", {})
             name = str(f.get(S_NAME) or "").strip()
-            verts = {v for k, v in PERSON_VERTICALS.items()
-                     if k in str(f.get(S_VERTICAL) or "").lower()}
-            people[rec["id"]] = {"name": name, "verticals": verts}
+            team = f.get(S_TEAM)
+            team = (team[0] if isinstance(team, list) and team else team) or ""
+            people[rec["id"]] = {"name": name, "team": team}
             for field in (S_EMAIL, S_SECOND):
                 e = str(f.get(field) or "").strip().lower()
                 if e:
@@ -214,21 +225,97 @@ def hours_offered(rule, days):
     return total / 60
 
 
-def pool_vertical(name):
+def pool_category(name, horizon_account):
+    """(category, vertical) for an interview pool."""
+    n = " ".join(name.split())
+    if horizon_account:
+        return "horizon", "horizon"
+    if LUMIERE_POOL.search(n):
+        return "lumiere", "lumiere"
+    if WHITE_LABEL_POOL.search(n):
+        return "white label", "white label"
     for pattern, vertical in POOL_VERTICAL:
-        if pattern.search(name):
-            return vertical
-    return DEFAULT_VERTICAL
+        if pattern.search(n):
+            return "other", vertical
+    return "other", DEFAULT_VERTICAL
 
 
 def short_name(name):
     n = " ".join(name.split())
     if LUMIERE_POOL.search(n):
         return "Lumiere RSP Americas" if "americas" in n.lower() else "Lumiere RSP"
+    if re.match(r"(?i)research program interview slot", n):
+        return "White Label RSP"
+    if re.match(r"(?i)jli\b", n):
+        return "JLI"
     n = re.sub(r"\s*\|.*$", "", n)                       # "Ladder Internships Interview | Upcoming Cohort"
     n = re.sub(r"(?i)\b(interviews?|sign-up|call|round|slot)\b", "", n)
     n = re.sub(r"[:\-–]+\s*$", "", " ".join(n.split())).strip(" -:")
     return n or name.strip()
+
+
+# ---------------------------------------------------------------- Calendly account
+
+def read_account(token, horizon_account, by_email, by_name):
+    """Interview pools and each host's availability on them, for one Calendly account."""
+    me = calendly("/users/me", token)["resource"]
+    org = me["current_organization"]
+    users = {}
+    for m in calendly_all("/organization_memberships", token, {"organization": org, "count": 100}):
+        u = m.get("user") or {}
+        users[u.get("uri")] = {"email": u.get("email"), "name": u.get("name")}
+
+    pools = {}
+    for et in calendly_all("/event_types", token, {"user": me["uri"], "active": "true", "count": 100}):
+        name = et.get("name") or ""
+        if et.get("pooling_type") and INTERVIEW_POOL.search(name) and not SKIP_POOL.search(name):
+            cat, vert = pool_category(name, horizon_account)
+            pools[et["uri"]] = {"name": name, "short": short_name(name), "cat": cat, "vertical": vert}
+
+    host_rules, unmatched = [], set()
+    for uri in pools:
+        for sch in calendly_all("/event_type_availability_schedules", token, {"event_type": uri}):
+            rule = sch.get("availability_rule") or {}
+            u = users.get(rule.get("user"), {})
+            rid = match_person(u, by_email, by_name)
+            if rid:
+                host_rules.append((rid, uri, rule))
+            elif u.get("email") and u.get("email") != me.get("email"):
+                unmatched.add(u.get("name") or u.get("email"))
+        time.sleep(0.2)
+    return {"token": token, "org": org, "pools": pools, "host_rules": host_rules,
+            "unmatched": unmatched, "horizon": horizon_account}
+
+
+def count_bookings(acct, lo, hi, fig, by_email, by_name):
+    now = datetime.now(timezone.utc)
+    for status in ("active", "canceled"):
+        events = calendly_all("/scheduled_events", acct["token"], {
+            "organization": acct["org"], "status": status, "count": 100,
+            "min_start_time": lo.isoformat().replace("+00:00", "Z"),
+            "max_start_time": hi.isoformat().replace("+00:00", "Z")})
+        for ev in events:
+            if ev.get("event_type") not in acct["pools"]:
+                continue
+            for mem in ev.get("event_memberships") or []:
+                rid = match_person({"email": mem.get("user_email"), "name": mem.get("user_name")},
+                                   by_email, by_name)
+                if not rid or rid not in fig:
+                    continue
+                f = fig[rid]
+                if status == "canceled":
+                    f["noshow"] += 1
+                    continue
+                f["booked"] += 1
+                end = datetime.fromisoformat(ev["end_time"].replace("Z", "+00:00"))
+                if end > now:
+                    continue
+                invitees = calendly_all(f"{ev['uri']}/invitees", acct["token"], {"count": 100})
+                if any(i.get("no_show") for i in invitees):
+                    f["noshow"] += 1
+                else:
+                    f["taken"] += 1
+                time.sleep(0.1)
 
 
 # ---------------------------------------------------------------- main
@@ -239,48 +326,19 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    cal_token, at_token = os.getenv("CALENDLY_TOKEN"), os.getenv("AIRTABLE_TOKEN")
-    if not cal_token or not at_token:
-        print("CALENDLY_TOKEN or AIRTABLE_TOKEN not set; skipping interview sync.")
+    at_token = os.getenv("AIRTABLE_TOKEN")
+    tokens = [(os.getenv("CALENDLY_TOKEN"), False), (os.getenv("HORIZON_CALENDLY_TOKEN"), True)]
+    tokens = [(t, h) for t, h in tokens if t]
+    if not at_token or not tokens:
+        print("AIRTABLE_TOKEN or CALENDLY_TOKEN not set; skipping interview sync.")
         return 0
-
-    me = calendly("/users/me", cal_token)["resource"]
-    org = me["current_organization"]
-
-    # Calendly users (uri -> email, name)
-    users = {}
-    for m in calendly_all("/organization_memberships", cal_token, {"organization": org, "count": 100}):
-        u = m.get("user") or {}
-        users[u.get("uri")] = {"email": u.get("email"), "name": u.get("name")}
-
-    # Interview pools on this account
-    pools = {}
-    for et in calendly_all("/event_types", cal_token, {"user": me["uri"], "active": "true", "count": 100}):
-        name = et.get("name") or ""
-        if et.get("pooling_type") and INTERVIEW_POOL.search(name) and not SKIP_POOL.search(name):
-            pools[et["uri"]] = {
-                "name": et["name"],
-                "short": short_name(et["name"]),
-                "lumiere": bool(LUMIERE_POOL.search(" ".join(et["name"].split()))),
-                "vertical": pool_vertical(et["name"]),
-            }
-    print(f"{len(pools)} interview pools:", "; ".join(sorted(p["short"] for p in pools.values())))
+    have_horizon = any(h for _, h in tokens)
 
     people, by_email, by_name = load_staff(at_token)
-
-    # Each host's availability on each pool (current rules)
-    host_rules = []   # (staff record id, pool uri, rule)
-    unmatched = set()
-    for uri in pools:
-        for s in calendly_all("/event_type_availability_schedules", cal_token, {"event_type": uri}):
-            rule = s.get("availability_rule") or {}
-            u = users.get(rule.get("user"), {})
-            rid = match_person(u, by_email, by_name)
-            if rid:
-                host_rules.append((rid, uri, rule))
-            elif u.get("email") and u.get("email") != me.get("email"):
-                unmatched.add(u.get("name") or u.get("email"))
-        time.sleep(0.2)
+    accounts = [read_account(t, h, by_email, by_name) for t, h in tokens]
+    for a in accounts:
+        print(f"{'Horizon' if a['horizon'] else 'Lumiere'} Calendly: {len(a['pools'])} interview pools: "
+              + "; ".join(sorted(f"{p['short']} ({p['cat']})" for p in a["pools"].values())))
 
     today = datetime.now(timezone.utc).date()
     this_monday = today - timedelta(days=today.weekday())
@@ -289,75 +347,53 @@ def main():
     records = []
     for monday in mondays:
         days = [monday + timedelta(days=i) for i in range(7)]
-        fig = {rid: {"lum": 0.0, "oth": 0.0, "cross": 0.0, "by_pool": {},
-                     "booked": 0, "taken": 0, "noshow": 0} for rid in people}
-
-        for rid, uri, rule in host_rules:
-            h = hours_offered(rule, days)
-            if not h:
-                continue
-            p, f = pools[uri], fig[rid]
-            f["lum" if p["lumiere"] else "oth"] += h
-            if p["vertical"] not in people[rid]["verticals"]:
-                f["cross"] += h
-            f["by_pool"][p["short"]] = f["by_pool"].get(p["short"], 0) + h
-
-        # Bookings that week (UTC Monday 00:00 to next Monday 00:00)
+        fig = {rid: {"lumiere": 0.0, "other": 0.0, "white label": 0.0, "horizon": 0.0,
+                     "cross": 0.0, "by_pool": {}, "booked": 0, "taken": 0, "noshow": 0}
+               for rid in people}
         lo = datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc)
         hi = lo + timedelta(days=7)
-        now = datetime.now(timezone.utc)
-        for status in ("active", "canceled"):
-            events = calendly_all("/scheduled_events", cal_token, {
-                "organization": org, "status": status, "count": 100,
-                "min_start_time": lo.isoformat().replace("+00:00", "Z"),
-                "max_start_time": hi.isoformat().replace("+00:00", "Z")})
-            for ev in events:
-                if ev.get("event_type") not in pools:
+
+        for acct in accounts:
+            for rid, uri, rule in acct["host_rules"]:
+                h = hours_offered(rule, days)
+                if not h:
                     continue
-                for mem in ev.get("event_memberships") or []:
-                    rid = match_person({"email": mem.get("user_email"), "name": mem.get("user_name")},
-                                       by_email, by_name)
-                    if not rid:
-                        continue
-                    f = fig[rid]
-                    if status == "canceled":
-                        f["noshow"] += 1
-                        continue
-                    f["booked"] += 1
-                    end = datetime.fromisoformat(ev["end_time"].replace("Z", "+00:00"))
-                    if end > now:
-                        continue
-                    invitees = calendly_all(f"{ev['uri']}/invitees", cal_token, {"count": 100})
-                    if any(i.get("no_show") for i in invitees):
-                        f["noshow"] += 1
-                    else:
-                        f["taken"] += 1
-                    time.sleep(0.1)
+                p, f = acct["pools"][uri], fig[rid]
+                f[p["cat"]] += h
+                own = TEAM_VERTICAL.get(people[rid]["team"])
+                if own and p["vertical"] != own:
+                    f["cross"] += h
+                f["by_pool"][p["short"]] = f["by_pool"].get(p["short"], 0) + h
+            count_bookings(acct, lo, hi, fig, by_email, by_name)
 
         for rid, f in fig.items():
             parts = sorted(f["by_pool"].items(), key=lambda kv: -kv[1])
-            records.append({"fields": {
+            fields = {
                 F_KEY: f"{rid}|{monday.isoformat()}",
                 F_NAME: f"{people[rid]['name']} – w/c {monday.isoformat()}",
                 F_MEMBER: [rid],
                 F_WEEK: monday.isoformat(),
-                F_LUM: round(f["lum"], 1),
-                F_OTH: round(f["oth"], 1),
+                F_LUM: round(f["lumiere"], 1),
+                F_OTH: round(f["other"], 1),
+                F_WL: round(f["white label"], 1),
                 F_CROSS: round(f["cross"], 1),
                 F_BOOKED: f["booked"],
                 F_TAKEN: f["taken"],
                 F_NOSHOW: f["noshow"],
                 F_BREAKDOWN: " · ".join(f"{n} {round(h, 1):g}h" for n, h in parts) or "none",
-            }})
+            }
+            if have_horizon:
+                fields[F_HOR] = round(f["horizon"], 1)
+            records.append({"fields": fields})
 
     for i in range(0, len(records), 10):
         chunk = records[i:i + 10]
         if args.dry_run:
             for r in chunk:
                 fl = r["fields"]
-                print(f"  {fl[F_NAME]}: Lumiere {fl[F_LUM]}h, Other {fl[F_OTH]}h, "
-                      f"cross-team {fl[F_CROSS]}h, booked {fl[F_BOOKED]}, taken {fl[F_TAKEN]}, "
-                      f"no-show/cancelled {fl[F_NOSHOW]} | {fl[F_BREAKDOWN]}")
+                print(f"  {fl[F_NAME]}: Lumiere {fl[F_LUM]}h, Other {fl[F_OTH]}h, WL {fl[F_WL]}h, "
+                      f"Horizon {fl.get(F_HOR, '-')}h, cross-team {fl[F_CROSS]}h, booked {fl[F_BOOKED]}, "
+                      f"taken {fl[F_TAKEN]}, no-show/cancelled {fl[F_NOSHOW]} | {fl[F_BREAKDOWN]}")
             continue
         airtable("PATCH", f"{BASE_ID}/{METRIC_TABLE}", at_token, body={
             "performUpsert": {"fieldsToMergeOn": [F_KEY]},
@@ -368,6 +404,7 @@ def main():
 
     print(f"{'Would write' if args.dry_run else 'Wrote'} {len(records)} rows "
           f"({len(people)} people x {len(mondays)} weeks).")
+    unmatched = set().union(*(a["unmatched"] for a in accounts))
     if unmatched:
         print("Calendly hosts not in scope or not on the Staff Table (skipped):",
               ", ".join(sorted(unmatched)))

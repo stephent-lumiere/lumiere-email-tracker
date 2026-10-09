@@ -113,6 +113,7 @@ jobs:
         env:
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
           CALENDLY_TOKEN: ${{ secrets.CALENDLY_TOKEN }}
+          HORIZON_CALENDLY_TOKEN: ${{ secrets.HORIZON_CALENDLY_TOKEN }}
         run: |
           if [ "${{ github.event.inputs.interview_dry_run }}" == "true" ]; then
             python interview_hours_sync.py --dry-run
