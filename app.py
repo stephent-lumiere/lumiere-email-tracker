@@ -325,6 +325,22 @@ def _calculate_adjusted_hours_cached(
     return total_seconds / 3600
 
 
+def _fmt_local(ts, tz_name: str) -> str:
+    """Show a stored UTC timestamp in the mailbox owner's own timezone.
+    Timestamps are stored in UTC; showing them raw made response times look
+    wrong to anyone reading them as local time."""
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)) or ts == "":
+        return ""
+    dt = pd.to_datetime(ts)
+    if dt.tzinfo is None:
+        dt = dt.tz_localize("UTC")
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    return dt.tz_convert(tz).strftime('%a %b %d, %H:%M')
+
+
 def _norm_ts(ts) -> str:
     """Normalize a timestamp string to UTC seconds precision for reliable comparison.
     Used as the canonical form for (thread_id, replied_at) exclusion/whitelist keys."""
@@ -703,10 +719,11 @@ def get_received_emails(user_email: str, start_date: date, end_date: date, limit
 
     df = pd.DataFrame(rows)
 
-    # Format timestamps
-    df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
+    # Format timestamps in the mailbox owner's own timezone
+    owner_tz = get_user_work_settings(user_email).get("timezone") or "America/New_York"
+    df['received_at'] = df['received_at'].apply(lambda x: _fmt_local(x, owner_tz))
     df['replied_at'] = df['replied_at'].apply(
-        lambda x: pd.to_datetime(x).strftime('%b %d, %H:%M') if pd.notna(x) and x else ""
+        lambda x: _fmt_local(x, owner_tz) if pd.notna(x) and x else ""
     )
 
     # Format response time
@@ -932,9 +949,10 @@ def get_recent_response_pairs(user_email: str, start_date: date, end_date: date,
     else:
         df['display_hours'] = df['response_hours']
 
-    # Format the data for display
-    df['received_at'] = pd.to_datetime(df['received_at']).dt.strftime('%b %d, %H:%M')
-    df['replied_at'] = pd.to_datetime(df['replied_at']).dt.strftime('%b %d, %H:%M')
+    # Format the data for display, in the mailbox owner's own timezone
+    owner_tz = get_user_work_settings(user_email).get("timezone") or "America/New_York"
+    df['received_at'] = df['raw_received_at'].apply(lambda x: _fmt_local(x, owner_tz))
+    df['replied_at'] = df['raw_replied_at'].apply(lambda x: _fmt_local(x, owner_tz))
 
     # Format response time
     def format_response_time(hours):
@@ -1824,7 +1842,11 @@ with tab_dashboard:
         col_header, col_limit = st.columns([3, 1])
         with col_header:
             st.subheader("Recent Tracked Response Pairs")
-            st.caption(f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}")
+            _pairs_tz = get_user_work_settings(selected_individual).get("timezone") or "America/New_York"
+            st.caption(
+                f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')} · "
+                f"times shown in this person's timezone ({_pairs_tz})"
+            )
         with col_limit:
             pairs_option = st.selectbox(
                 "Show",
@@ -1966,7 +1988,8 @@ with tab_dashboard:
         col_recv_header, col_recv_limit = st.columns([3, 1])
         with col_recv_header:
             st.subheader("Recent Emails Received")
-            st.caption(f"External emails received by {selected_individual}")
+            _recv_tz = get_user_work_settings(selected_individual).get("timezone") or "America/New_York"
+            st.caption(f"External emails received by {selected_individual} · times shown in their timezone ({_recv_tz})")
         with col_recv_limit:
             received_option = st.selectbox(
                 "Show",
