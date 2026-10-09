@@ -38,6 +38,14 @@ on:
         options:
           - 'false'
           - 'true'
+      interview_dry_run:
+        description: 'Interview hours: print what would be written, write nothing'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
       debug:
         description: 'Print threads where user sent but no pair was found (use with a specific user_email)'
         required: false
@@ -99,3 +107,15 @@ jobs:
           AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
           AIRTABLE_WEEKS: ${{ github.event.inputs.airtable_weeks || '2' }}
         run: python airtable_weekly_sync.py
+
+      - name: Write interview hours to Airtable (competency system)
+        if: always()
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          CALENDLY_TOKEN: ${{ secrets.CALENDLY_TOKEN }}
+        run: |
+          if [ "${{ github.event.inputs.interview_dry_run }}" == "true" ]; then
+            python interview_hours_sync.py --dry-run
+          else
+            python interview_hours_sync.py
+          fi
