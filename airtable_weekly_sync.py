@@ -17,8 +17,8 @@ the standards were set against:
   - median / average come from every individual response that week,
     never from averaging daily medians
   - emails sent is the sum of daily_stats for the week
-Only Active people on the Staff Table whose Last Updated Vertical includes
-Lumiere Education or Horizon Academics get a row (VERTICALS below).
+Only people whose Staff Table "In Competency Scope" formula is 1 get a row
+(the formula, not this script, decides who is tracked).
 A person can have two inboxes: their Staff Email, and a second one (e.g. a
 white-label or Horizon inbox) in the Staff Table's "Second Inbox Email"
 field. Each inbox gets its own figures on the same row (the "Second Email"
@@ -66,8 +66,7 @@ F_STAFF_EMAIL = "Staff Email"
 F_STAFF_SECOND = "Second Inbox Email"
 F_STAFF_NAME = "Name"
 F_STAFF_STATUS = "Status"
-F_STAFF_VERTICAL = "Last Updated Vertical"
-VERTICALS = ("lumiere education", "horizon academics")  # who gets a row
+F_STAFF_SCOPE = "In Competency Scope"   # Staff Table formula: 1 = tracked
 
 # Metric Tracking fields written by this script
 F_KEY = "Record Key"
@@ -112,7 +111,7 @@ def _airtable(method, path, token, params=None, body=None):
 def load_staff(token):
     """Map each inbox address (lower-case) -> (record id, name, slot 1 or 2).
 
-    Only Active people; records named "Test ..." are ignored. If an address is
+    Only people with In Competency Scope = 1. If an address is
     someone's Second Inbox Email, that wins over another record that has the
     same address as its Staff Email (e.g. a separate white-label record).
     """
@@ -125,14 +124,11 @@ def load_staff(token):
         page = _airtable("GET", f"{BASE_ID}/{STAFF_TABLE}", token, params=params)
         for rec in page.get("records", []):
             f = rec.get("fields", {})
-            if str(f.get(F_STAFF_STATUS) or "").strip().lower() != "active":
-                continue
-            vertical = str(f.get(F_STAFF_VERTICAL) or "").lower()
-            if not any(v in vertical for v in VERTICALS):
+            # Who is tracked is decided in Airtable (Active, Lumiere/Horizon,
+            # Operations or Publications team, not a test record).
+            if f.get(F_STAFF_SCOPE) != 1:
                 continue
             name = str(f.get(F_STAFF_NAME) or rec["id"]).strip()
-            if name.lower().startswith("test"):
-                continue
             for slot, field, target in ((1, F_STAFF_EMAIL, first), (2, F_STAFF_SECOND, second)):
                 e = str(f.get(field) or "").strip().lower()
                 if not e:
