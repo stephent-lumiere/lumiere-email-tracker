@@ -102,6 +102,10 @@ def _request(url, token, method="GET", body=None):
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
+        # Calendly sits behind Cloudflare, which blocks Python's default
+        # user agent ("Python-urllib") with "error code: 1010".
+        "User-Agent": "lumiere-interview-hours-sync/1.0",
     })
     for attempt in range(5):
         try:
@@ -332,10 +336,18 @@ def main():
     if not at_token or not tokens:
         print("AIRTABLE_TOKEN or CALENDLY_TOKEN not set; skipping interview sync.")
         return 0
-    have_horizon = any(h for _, h in tokens)
 
     people, by_email, by_name = load_staff(at_token)
-    accounts = [read_account(t, h, by_email, by_name) for t, h in tokens]
+    accounts = []
+    for t, h in tokens:
+        try:
+            accounts.append(read_account(t, h, by_email, by_name))
+        except RuntimeError as e:
+            print(f"Skipping the {'Horizon' if h else 'Lumiere'} Calendly account: {e}")
+    if not accounts:
+        print("No Calendly account could be read; nothing written.")
+        return 1
+    have_horizon = any(a["horizon"] for a in accounts)
     for a in accounts:
         print(f"{'Horizon' if a['horizon'] else 'Lumiere'} Calendly: {len(a['pools'])} interview pools: "
               + "; ".join(sorted(f"{p['short']} ({p['cat']})" for p in a["pools"].values())))
