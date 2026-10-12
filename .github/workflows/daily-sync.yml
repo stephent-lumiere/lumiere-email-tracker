@@ -46,6 +46,18 @@ on:
         options:
           - 'false'
           - 'true'
+      interview_recompute:
+        description: 'Interview hours: recalculate stored days using Google Calendar busy time'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      interview_weeks_back:
+        description: 'Interview hours: completed weeks to rewrite before this week (default 1)'
+        required: false
+        default: '1'
       debug:
         description: 'Print threads where user sent but no pair was found (use with a specific user_email)'
         required: false
@@ -115,8 +127,11 @@ jobs:
           CALENDLY_TOKEN: ${{ secrets.CALENDLY_TOKEN }}
           HORIZON_CALENDLY_TOKEN: ${{ secrets.HORIZON_CALENDLY_TOKEN }}
         run: |
-          if [ "${{ github.event.inputs.interview_dry_run }}" == "true" ]; then
-            python interview_hours_sync.py --dry-run
-          else
-            python interview_hours_sync.py
+          ARGS="--weeks-back ${{ github.event.inputs.interview_weeks_back || '1' }}"
+          if [ "${{ github.event.inputs.interview_recompute }}" == "true" ]; then
+            ARGS="$ARGS --recompute"
           fi
+          if [ "${{ github.event.inputs.interview_dry_run }}" == "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python interview_hours_sync.py $ARGS

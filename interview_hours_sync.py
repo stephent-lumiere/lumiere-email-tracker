@@ -37,6 +37,12 @@ Where the numbers come from (Calendly):
   - Booked = bookings on those pools that week (not cancelled). Taken =
     booked, already finished, invitee not marked a no-show. No-show or
     cancelled = cancelled bookings + invitee no-shows.
+  - Google Calendar (calendar_interviews.py, read-only via the tracker's
+    service account): when a person's calendar can be read, their own
+    calendar's busy time replaces Calendly's (it also covers days already
+    past), and "Interviews Held (Calendar)" counts every finished interview
+    event on their calendar, for any vertical, with hours and a breakdown.
+    --recompute recalculates stored days; --weeks-back N rewrites N past weeks.
   - Cross-team = hours offered on another vertical's pools (e.g. a Lumiere PM
     on the Ladder pool). Information only; it doesn't affect any target.
 
@@ -65,6 +71,8 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
+import calendar_interviews as gcal
+
 BASE_ID = "apptbsqs9gIs3Aiva"            # Research Programs Evaluations
 STAFF_TABLE = "tbljITYVsEwqZSuzI"        # Staff Table (synced)
 METRIC_TABLE = "tblNaK1sQM5LQxu3k"       # Metric Tracking
@@ -84,6 +92,9 @@ F_BOOKED = "Interviews Booked"
 F_TAKEN = "Interviews Taken"
 F_NOSHOW = "Interviews No-show or Cancelled"
 F_BREAKDOWN = "Interview Hours - Breakdown"
+F_CAL_HELD = "Interviews Held (Calendar)"
+F_CAL_HOURS = "Interview Hours Held (Calendar)"
+F_CAL_BREAKDOWN = "Interviews Held - Breakdown (Calendar)"
 
 INTERVIEW_POOL = re.compile(r"interview|sign-up|mentorship position|\bharp\b", re.I)
 SKIP_POOL = re.compile(r"uceazy|20(1\d|2[0-3])", re.I)   # old one-off pools (e.g. UCEazy 2022)
@@ -173,11 +184,12 @@ def load_staff(token):
             name = str(f.get(S_NAME) or "").strip()
             team = f.get(S_TEAM)
             team = (team[0] if isinstance(team, list) and team else team) or ""
-            people[rec["id"]] = {"name": name, "team": team}
+            people[rec["id"]] = {"name": name, "team": team, "emails": []}
             for field in (S_EMAIL, S_SECOND):
                 e = str(f.get(field) or "").strip().lower()
                 if e:
                     by_email[e] = rec["id"]
+                    people[rec["id"]]["emails"].append(e)
             by_name[_norm_name(name)] = rec["id"]
         offset = page.get("offset")
         if not offset:
@@ -467,6 +479,10 @@ def main():
     load_dotenv()
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--weeks-back", type=int, default=1,
+                    help="completed weeks to (re)write before this week (default 1)")
+    ap.add_argument("--recompute", action="store_true",
+                    help="recalculate days already stored (uses Google Calendar busy time for past days)")
     args = ap.parse_args()
 
     at_token = os.getenv("AIRTABLE_TOKEN")
@@ -494,11 +510,13 @@ def main():
     now = datetime.now(UTC)
     today = now.date()
     this_monday = today - timedelta(days=today.weekday())
-    mondays = [this_monday - timedelta(weeks=1), this_monday, this_monday + timedelta(weeks=1)]
+    back = max(1, args.weeks_back)
+    mondays = [this_monday - timedelta(weeks=k) for k in range(back, 0, -1)] + \
+              [this_monday, this_monday + timedelta(weeks=1)]
 
     # Days already stored on the Metric Tracking rows. A day is fixed once it
     # has started for the person; only days still ahead are recalculated.
-    stored = load_daily(at_token, mondays)
+    stored = {} if args.recompute else load_daily(at_token, mondays)
 
     # Busy calendar time for every host, from now to the end of next week.
     busy_hi = datetime.combine(mondays[-1] + timedelta(days=8), dtime(0, 0), tzinfo=UTC)
@@ -511,6 +529,17 @@ def main():
     if no_busy:
         print(f"Busy times unavailable for {no_busy} of {len(busy)} Calendly hosts; "
               "their hours are counted without removing calendar events.")
+
+    # Google Calendar (read-only, via the tracker's service account): interviews
+    # held, and busy time that also covers days already past.
+    cal_lo = datetime.combine(mondays[0] - timedelta(days=1), dtime(0, 0), tzinfo=UTC)
+    gevents = {}
+    calendar = gcal.Calendar.from_env()
+    if calendar:
+        for rid in people:
+            gevents[rid] = calendar.events(people[rid]["emails"], cal_lo, busy_hi)
+        read = sum(1 for v in gevents.values() if v is not None)
+        print(f"Google Calendar read for {read} of {len(people)} people.")
 
     # Each person's timezone (from their first availability rule) decides when a day has started.
     person_tz = {}
@@ -532,6 +561,7 @@ def main():
             daily = dict(stored.get(key, {}))
             tz = person_tz.get(rid, UTC)
             own = TEAM_VERTICAL.get(people[rid]["team"])
+            g_busy = gcal.busy(gevents.get(rid))
             for d in days:
                 started = now >= datetime.combine(d, dtime(0, 0), tzinfo=tz)
                 if started and d.isoformat() in daily:
@@ -549,8 +579,12 @@ def main():
                             checked = False
                         else:
                             person_busy.extend(b)
-                daily[d.isoformat()] = day_figures(
-                    entries, own, person_busy if checked else None, now)
+                if g_busy is not None:
+                    # Google Calendar covers past days too, so nothing is left uncut.
+                    daily[d.isoformat()] = day_figures(entries, own, g_busy, cal_lo)
+                else:
+                    daily[d.isoformat()] = day_figures(
+                        entries, own, person_busy if checked else None, now)
 
             tot = {c: sum(v.get(c, 0) for v in daily.values()) for c in CATEGORIES + ["cross"]}
             pools = {}
@@ -575,6 +609,12 @@ def main():
                 F_BREAKDOWN: (" · ".join(f"{n} {round(h, 1):g}h" for n, h in parts) or "none") + note,
                 F_DAILY: json.dumps(daily, separators=(",", ":"), sort_keys=True),
             }
+            h = gcal.held(gevents.get(rid), lo, hi, now)
+            if h is not None:
+                fields[F_CAL_HELD] = h["count"]
+                fields[F_CAL_HOURS] = h["hours"]
+                fields[F_CAL_BREAKDOWN] = " · ".join(
+                    f"{k} {v}" for k, v in sorted(h["by"].items(), key=lambda kv: -kv[1])) or "none"
             if have_horizon:
                 fields[F_HOR] = round(tot["horizon"], 1)
             records.append({"fields": fields})
@@ -586,7 +626,8 @@ def main():
                 fl = r["fields"]
                 print(f"  {fl[F_NAME]}: Lumiere {fl[F_LUM]}h, Other {fl[F_OTH]}h, WL {fl[F_WL]}h, "
                       f"Horizon {fl.get(F_HOR, '-')}h, cross-team {fl[F_CROSS]}h, booked {fl[F_BOOKED]}, "
-                      f"taken {fl[F_TAKEN]}, no-show/cancelled {fl[F_NOSHOW]} | {fl[F_BREAKDOWN]}")
+                      f"taken {fl[F_TAKEN]}, no-show/cancelled {fl[F_NOSHOW]} | {fl[F_BREAKDOWN]}"
+                      f" | calendar held {fl.get(F_CAL_HELD, '-')} ({fl.get(F_CAL_BREAKDOWN, 'not read')})")
             continue
         airtable("PATCH", f"{BASE_ID}/{METRIC_TABLE}", at_token, body={
             "performUpsert": {"fieldsToMergeOn": [F_KEY]},
