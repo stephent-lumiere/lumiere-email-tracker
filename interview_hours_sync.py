@@ -24,10 +24,16 @@ Where the numbers come from (Calendly):
     Interview" (main + Americas); White Label = JLI + "Research Program
     Interview Slot"; Horizon = every interview pool on the Horizon account;
     Other = every other interview pool.
-  - Hours offered = each host's own availability on that pool for each day
-    of the week (weekly hours, date overrides taking priority), in the host's
-    timezone - what they opened up, before Calendly removes slots that clash
-    with their own calendar.
+  - Hours offered = each host's own availability on their interview pools
+    for each day (weekly hours, date overrides taking priority, in the host's
+    timezone), counted once: an hour open on two pools counts once, claimed
+    first by the person's own team's pools, then Lumiere, White Label,
+    Horizon, Other. Time their connected calendar shows as busy (Calendly
+    "busy times", calendar events only) is then removed, so the figure is
+    time genuinely free for interviews.
+  - Each day is fixed once it has started for the person (stored per day in
+    "Interview Hours - Daily (sync)"); only days still ahead are recalculated,
+    because Calendly only reports current availability and future busy time.
   - Booked = bookings on those pools that week (not cancelled). Taken =
     booked, already finished, invitee not marked a no-show. No-show or
     cancelled = cancelled bookings + invitee no-shows.
@@ -54,6 +60,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -210,25 +218,6 @@ def interval_minutes(iv):
     return end - start
 
 
-def hours_offered(rule, days):
-    """Hours a host's availability rule opens on the given dates.
-
-    Dates are read in the host's own timezone, as Calendly does: a date
-    override replaces that weekday's normal hours for that date.
-    """
-    weekly, dated = {}, {}
-    for r in rule.get("rules") or []:
-        if r.get("type") == "wday" and r.get("wday"):
-            weekly[r["wday"].lower()] = r.get("intervals") or []
-        elif r.get("type") == "date" and r.get("date"):
-            dated[r["date"]] = r.get("intervals") or []
-    total = 0
-    for d in days:
-        ivs = dated.get(d.isoformat(), weekly.get(DAYS[d.weekday()], []))
-        total += sum(interval_minutes(iv) for iv in ivs)
-    return total / 60
-
-
 def pool_category(name, horizon_account):
     """(category, vertical) for an interview pool."""
     n = " ".join(name.split())
@@ -256,6 +245,156 @@ def short_name(name):
     n = re.sub(r"(?i)\b(interviews?|sign-up|call|round|slot)\b", "", n)
     n = re.sub(r"[:\-–]+\s*$", "", " ".join(n.split())).strip(" -:")
     return n or name.strip()
+
+
+# ---------------------------------------------------------------- hours (de-duplicated, minus busy time)
+
+UTC = timezone.utc
+F_DAILY = "Interview Hours - Daily (sync)"
+CATEGORIES = ["lumiere", "white label", "horizon", "other"]
+
+
+def _local_dt(d, minutes, tz):
+    """Local date d + minutes past midnight (24:00 allowed) as a UTC datetime."""
+    return (datetime.combine(d, dtime(0, 0), tzinfo=tz) + timedelta(minutes=minutes)).astimezone(UTC)
+
+
+def rule_intervals(rule, d):
+    """UTC (start, end) intervals a host's availability rule opens on local date d."""
+    tz = ZoneInfo(rule.get("timezone") or "UTC")
+    weekly, dated = {}, {}
+    for r in rule.get("rules") or []:
+        if r.get("type") == "wday" and r.get("wday"):
+            weekly[r["wday"].lower()] = r.get("intervals") or []
+        elif r.get("type") == "date" and r.get("date"):
+            dated[r["date"]] = r.get("intervals") or []
+    out = []
+    for iv in dated.get(d.isoformat(), weekly.get(DAYS[d.weekday()], [])):
+        start, end = _minutes(iv["from"]), _minutes(iv["to"])
+        if end <= start:                      # runs past midnight
+            end += 24 * 60
+        out.append((_local_dt(d, start, tz), _local_dt(d, end, tz)))
+    return out
+
+
+def union(ivs):
+    """Merge overlapping intervals."""
+    out = []
+    for s, e in sorted(ivs):
+        if out and s <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def subtract(ivs, cut):
+    """ivs minus cut (both lists of intervals)."""
+    cut = union(cut)
+    out = []
+    for s, e in union(ivs):
+        pieces = [(s, e)]
+        for cs, ce in cut:
+            nxt = []
+            for ps, pe in pieces:
+                if ce <= ps or cs >= pe:
+                    nxt.append((ps, pe))
+                    continue
+                if cs > ps:
+                    nxt.append((ps, cs))
+                if ce < pe:
+                    nxt.append((ce, pe))
+            pieces = nxt
+        out.extend(pieces)
+    return out
+
+
+def hours(ivs):
+    return sum((e - s).total_seconds() for s, e in union(ivs)) / 3600
+
+
+def busy_times(token, user_uri, lo, hi):
+    """Times the host's connected calendar shows as busy between lo and hi.
+
+    Only calendar ("external") events count. Calendly bookings are left in:
+    a booked interview hour was offered. Calendar copies of Calendly bookings
+    (same start and end) are dropped for the same reason.
+    Returns None if Calendly will not give busy times for this host.
+    """
+    out, cal, start = [], set(), lo
+    while start < hi:
+        end = min(start + timedelta(days=7), hi)
+        try:
+            items = calendly_all("/user_busy_times", token, {
+                "user": user_uri,
+                "start_time": start.isoformat().replace("+00:00", "Z"),
+                "end_time": end.isoformat().replace("+00:00", "Z")})
+        except RuntimeError as e:
+            print(f"  busy times unavailable for {user_uri.rsplit('/', 1)[-1]}: {str(e)[:200]}")
+            return None
+        for it in items:
+            s = datetime.fromisoformat(it["start_time"].replace("Z", "+00:00"))
+            e = datetime.fromisoformat(it["end_time"].replace("Z", "+00:00"))
+            if it.get("type") == "calendly":
+                cal.add((s, e))
+            else:
+                out.append((s, e))
+        start = end
+        time.sleep(0.2)
+    return [iv for iv in out if iv not in cal]
+
+
+def day_figures(entries, own, busy, after):
+    """One person's hours for one day.
+
+    entries: [(pool, intervals)] for the day. own: the person's team category
+    (or None). busy: busy intervals (or None if unknown). after: busy time is
+    only known from this moment on.
+    Each hour counts once: the person's own team's pools claim it first, then
+    Lumiere, White Label, Horizon, Other. Busy calendar time is then removed.
+    """
+    cut = [(max(s, after), e) for s, e in (busy or []) if e > after]
+    order = ([own] if own in CATEGORIES else []) + [c for c in CATEGORIES if c != own]
+    out, covered = {"pools": {}}, []
+    for cat in order:
+        ivs = union([iv for p, ivs in entries if p["cat"] == cat for iv in ivs])
+        mine = subtract(ivs, covered)
+        out[cat] = round(hours(subtract(mine, cut)), 2)
+        covered = union(covered + ivs)
+    if own:
+        other_vert = [iv for p, ivs in entries if p["vertical"] != own for iv in ivs]
+        out["cross"] = round(hours(subtract(other_vert, cut)), 2)
+    else:
+        out["cross"] = 0.0
+    for p, ivs in entries:
+        h = hours(subtract(ivs, cut))
+        if h:
+            out["pools"][p["short"]] = round(out["pools"].get(p["short"], 0) + h, 2)
+    out["busy_checked"] = busy is not None
+    return out
+
+
+def load_daily(token, mondays):
+    """Record Key -> stored per-day figures, for the given weeks."""
+    formula = "OR(" + ",".join(
+        f"IS_SAME({{{F_WEEK}}},'{m.isoformat()}','day')" for m in mondays) + ")"
+    out, offset = {}, None
+    while True:
+        params = {"pageSize": 100, "filterByFormula": formula, "fields[]": [F_KEY, F_DAILY]}
+        if offset:
+            params["offset"] = offset
+        page = airtable("GET", f"{BASE_ID}/{METRIC_TABLE}", token, params=params)
+        for rec in page.get("records", []):
+            f = rec.get("fields", {})
+            if f.get(F_KEY) and f.get(F_DAILY):
+                try:
+                    out[f[F_KEY]] = json.loads(f[F_DAILY])
+                except ValueError:
+                    pass
+        offset = page.get("offset")
+        if not offset:
+            return out
+        time.sleep(0.25)
 
 
 # ---------------------------------------------------------------- Calendly account
@@ -352,50 +491,92 @@ def main():
         print(f"{'Horizon' if a['horizon'] else 'Lumiere'} Calendly: {len(a['pools'])} interview pools: "
               + "; ".join(sorted(f"{p['short']} ({p['cat']})" for p in a["pools"].values())))
 
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(UTC)
+    today = now.date()
     this_monday = today - timedelta(days=today.weekday())
     mondays = [this_monday - timedelta(weeks=1), this_monday, this_monday + timedelta(weeks=1)]
+
+    # Days already stored on the Metric Tracking rows. A day is fixed once it
+    # has started for the person; only days still ahead are recalculated.
+    stored = load_daily(at_token, mondays)
+
+    # Busy calendar time for every host, from now to the end of next week.
+    busy_hi = datetime.combine(mondays[-1] + timedelta(days=8), dtime(0, 0), tzinfo=UTC)
+    busy = {}
+    for acct in accounts:
+        for user_uri in {rule.get("user") for _, _, rule in acct["host_rules"]}:
+            if user_uri and (id(acct), user_uri) not in busy:
+                busy[(id(acct), user_uri)] = busy_times(acct["token"], user_uri, now, busy_hi)
+    no_busy = sum(1 for v in busy.values() if v is None)
+    if no_busy:
+        print(f"Busy times unavailable for {no_busy} of {len(busy)} Calendly hosts; "
+              "their hours are counted without removing calendar events.")
+
+    # Each person's timezone (from their first availability rule) decides when a day has started.
+    person_tz = {}
+    for acct in accounts:
+        for rid, _, rule in acct["host_rules"]:
+            person_tz.setdefault(rid, ZoneInfo(rule.get("timezone") or "UTC"))
 
     records = []
     for monday in mondays:
         days = [monday + timedelta(days=i) for i in range(7)]
-        fig = {rid: {"lumiere": 0.0, "other": 0.0, "white label": 0.0, "horizon": 0.0,
-                     "cross": 0.0, "by_pool": {}, "booked": 0, "taken": 0, "noshow": 0}
-               for rid in people}
-        lo = datetime.combine(monday, datetime.min.time(), tzinfo=timezone.utc)
+        lo = datetime.combine(monday, datetime.min.time(), tzinfo=UTC)
         hi = lo + timedelta(days=7)
-
+        fig = {rid: {"booked": 0, "taken": 0, "noshow": 0} for rid in people}
         for acct in accounts:
-            for rid, uri, rule in acct["host_rules"]:
-                h = hours_offered(rule, days)
-                if not h:
-                    continue
-                p, f = acct["pools"][uri], fig[rid]
-                f[p["cat"]] += h
-                own = TEAM_VERTICAL.get(people[rid]["team"])
-                if own and p["vertical"] != own:
-                    f["cross"] += h
-                f["by_pool"][p["short"]] = f["by_pool"].get(p["short"], 0) + h
             count_bookings(acct, lo, hi, fig, by_email, by_name)
 
-        for rid, f in fig.items():
-            parts = sorted(f["by_pool"].items(), key=lambda kv: -kv[1])
+        for rid in people:
+            key = f"{rid}|{monday.isoformat()}"
+            daily = dict(stored.get(key, {}))
+            tz = person_tz.get(rid, UTC)
+            own = TEAM_VERTICAL.get(people[rid]["team"])
+            for d in days:
+                started = now >= datetime.combine(d, dtime(0, 0), tzinfo=tz)
+                if started and d.isoformat() in daily:
+                    continue                                   # fixed
+                entries, person_busy, checked = [], [], True
+                for acct in accounts:
+                    for host, uri, rule in acct["host_rules"]:
+                        if host != rid:
+                            continue
+                        ivs = rule_intervals(rule, d)
+                        if ivs:
+                            entries.append((acct["pools"][uri], ivs))
+                        b = busy.get((id(acct), rule.get("user")))
+                        if b is None:
+                            checked = False
+                        else:
+                            person_busy.extend(b)
+                daily[d.isoformat()] = day_figures(
+                    entries, own, person_busy if checked else None, now)
+
+            tot = {c: sum(v.get(c, 0) for v in daily.values()) for c in CATEGORIES + ["cross"]}
+            pools = {}
+            for v in daily.values():
+                for n, h in v.get("pools", {}).items():
+                    pools[n] = pools.get(n, 0) + h
+            parts = sorted(pools.items(), key=lambda kv: -kv[1])
+            unchecked = sum(1 for v in daily.values() if not v.get("busy_checked"))
+            note = f" (calendar not checked for {unchecked} of 7 days)" if unchecked else ""
             fields = {
-                F_KEY: f"{rid}|{monday.isoformat()}",
+                F_KEY: key,
                 F_NAME: f"{people[rid]['name']} – w/c {monday.isoformat()}",
                 F_MEMBER: [rid],
                 F_WEEK: monday.isoformat(),
-                F_LUM: round(f["lumiere"], 1),
-                F_OTH: round(f["other"], 1),
-                F_WL: round(f["white label"], 1),
-                F_CROSS: round(f["cross"], 1),
-                F_BOOKED: f["booked"],
-                F_TAKEN: f["taken"],
-                F_NOSHOW: f["noshow"],
-                F_BREAKDOWN: " · ".join(f"{n} {round(h, 1):g}h" for n, h in parts) or "none",
+                F_LUM: round(tot["lumiere"], 1),
+                F_OTH: round(tot["other"], 1),
+                F_WL: round(tot["white label"], 1),
+                F_CROSS: round(tot["cross"], 1),
+                F_BOOKED: fig[rid]["booked"],
+                F_TAKEN: fig[rid]["taken"],
+                F_NOSHOW: fig[rid]["noshow"],
+                F_BREAKDOWN: (" · ".join(f"{n} {round(h, 1):g}h" for n, h in parts) or "none") + note,
+                F_DAILY: json.dumps(daily, separators=(",", ":"), sort_keys=True),
             }
             if have_horizon:
-                fields[F_HOR] = round(f["horizon"], 1)
+                fields[F_HOR] = round(tot["horizon"], 1)
             records.append({"fields": fields})
 
     for i in range(0, len(records), 10):
