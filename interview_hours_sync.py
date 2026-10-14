@@ -95,6 +95,8 @@ F_BREAKDOWN = "Interview Hours - Breakdown"
 F_CAL_HELD = "Interviews Held (Calendar)"
 F_CAL_HOURS = "Interview Hours Held (Calendar)"
 F_CAL_BREAKDOWN = "Interviews Held - Breakdown (Calendar)"
+F_MEET_HOURS = "Meeting Hours (Calendar)"
+F_MEET_BREAKDOWN = "Meeting Hours - Breakdown (Calendar)"
 
 INTERVIEW_POOL = re.compile(r"interview|sign-up|mentorship position|\bharp\b", re.I)
 SKIP_POOL = re.compile(r"uceazy|20(1\d|2[0-3])", re.I)   # old one-off pools (e.g. UCEazy 2022)
@@ -615,6 +617,10 @@ def main():
                 fields[F_CAL_HOURS] = h["hours"]
                 fields[F_CAL_BREAKDOWN] = " · ".join(
                     f"{k} {v}" for k, v in sorted(h["by"].items(), key=lambda kv: -kv[1])) or "none"
+            m = gcal.meeting_hours(gevents.get(rid), lo, hi, now) if lo <= now else None
+            if m is not None:                                  # not written for weeks not yet started
+                fields[F_MEET_HOURS] = m["hours"]
+                fields[F_MEET_BREAKDOWN] = " · ".join(f"{k} {v:g}h" for k, v in m["by"].items())
             if have_horizon:
                 fields[F_HOR] = round(tot["horizon"], 1)
             records.append({"fields": fields})
@@ -627,7 +633,8 @@ def main():
                 print(f"  {fl[F_NAME]}: Lumiere {fl[F_LUM]}h, Other {fl[F_OTH]}h, WL {fl[F_WL]}h, "
                       f"Horizon {fl.get(F_HOR, '-')}h, cross-team {fl[F_CROSS]}h, booked {fl[F_BOOKED]}, "
                       f"taken {fl[F_TAKEN]}, no-show/cancelled {fl[F_NOSHOW]} | {fl[F_BREAKDOWN]}"
-                      f" | calendar held {fl.get(F_CAL_HELD, '-')} ({fl.get(F_CAL_BREAKDOWN, 'not read')})")
+                      f" | calendar held {fl.get(F_CAL_HELD, '-')} ({fl.get(F_CAL_BREAKDOWN, 'not read')})"
+                      f" | meetings {fl.get(F_MEET_HOURS, '-')}h ({fl.get(F_MEET_BREAKDOWN, 'not read')})")
             continue
         airtable("PATCH", f"{BASE_ID}/{METRIC_TABLE}", at_token, body={
             "performUpsert": {"fieldsToMergeOn": [F_KEY]},

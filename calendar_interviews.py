@@ -14,6 +14,11 @@ scope added by the Workspace admin). Two things come from it:
      not marked "free". Unlike Calendly's busy times this also covers days
      already past, so a day's hours offered can be worked out properly the
      first time it is calculated (or recalculated with --recompute).
+  3. Meeting hours: time spent in finished meetings (timed events with at
+     least one other attendee, not declined, not marked "free"), with
+     overlapping meetings counted once, split into interviews, meetings with
+     someone outside Lumiere (students, parents, mentors, partners) and
+     internal meetings. Informational only.
 
 Anything that can't be read (no access, a non-Lumiere address) returns None,
 and the caller falls back to what it did before.
@@ -28,6 +33,8 @@ UTC = timezone.utc
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly",
           "https://www.googleapis.com/auth/calendar.events.readonly"]
 DOMAINS = ("lumiere.education",)
+# Addresses on these domains count as internal (staff) for meeting hours.
+INTERNAL_DOMAINS = ("lumiere.education", "horizoninspires.com", "researchscholarprogram.com")
 
 INTERVIEW = re.compile(r"interview|mentorship position|\bharp\b", re.I)
 # (label, pattern): first match wins
@@ -114,7 +121,7 @@ class Calendar:
                     timeMax=hi.isoformat().replace("+00:00", "Z"),
                     maxResults=250, pageToken=token,
                     fields="nextPageToken,items(status,summary,description,start,end,"
-                           "attendees(self,email,responseStatus),transparency,eventType)").execute()
+                           "attendees(self,email,responseStatus,resource),transparency,eventType)").execute()
                 for ev in page.get("items", []):
                     if ev.get("status") == "cancelled" or "dateTime" not in (ev.get("start") or {}):
                         continue
@@ -123,7 +130,11 @@ class Calendar:
                         continue
                     ev["_s"], ev["_e"] = _parse(ev["start"]["dateTime"]), _parse(ev["end"]["dateTime"])
                     ev["_type"] = interview_type(ev)
-                    ev["_others"] = sum(1 for a in ev.get("attendees") or [] if not a.get("self"))
+                    others = [a for a in ev.get("attendees") or []
+                              if not a.get("self") and not a.get("resource")]
+                    ev["_others"] = len(others)
+                    ev["_external"] = any(
+                        not (a.get("email") or "").lower().endswith(INTERNAL_DOMAINS) for a in others)
                     out.append(ev)
                 token = page.get("nextPageToken")
                 if not token:
@@ -162,3 +173,42 @@ def held(events, lo, hi, now):
         hrs += mins / 60
         by[ev["_type"]] = by.get(ev["_type"], 0) + 1
     return {"count": n, "hours": round(hrs, 1), "by": by}
+
+
+def meeting_hours(events, lo, hi, now):
+    """Hours in finished meetings in [lo, hi), overlaps counted once. None if calendar unreadable.
+
+    A meeting is a timed event with at least one other (non-room) attendee that
+    the person didn't decline and that isn't marked "free". Events shorter than
+    5 minutes or longer than 8 hours are left out (holds and all-day blocks).
+    Returns {"hours": total, "by": {"Interviews": h, "External": h, "Internal": h}}.
+    """
+    if events is None:
+        return None
+    end_cap = min(hi, now)
+    picked = []
+    for ev in events:
+        if ev["_others"] < 1 or ev.get("transparency") == "transparent":
+            continue
+        if ev.get("eventType", "default") not in ("default", "focusTime"):
+            continue
+        mins = (ev["_e"] - ev["_s"]).total_seconds() / 60
+        if mins < 5 or mins > 480:
+            continue
+        s_, e_ = max(ev["_s"], lo), min(ev["_e"], end_cap)
+        if e_ <= s_:
+            continue
+        kind = "Interviews" if ev["_type"] else ("External" if ev.get("_external") else "Internal")
+        picked.append((s_, e_, kind))
+    # Walk the timeline so overlapping meetings are counted once; an overlap is
+    # credited to the first kind in priority order (Interviews, External, Internal).
+    order = {"Interviews": 0, "External": 1, "Internal": 2}
+    points = sorted({t for s_, e_, _ in picked for t in (s_, e_)})
+    by = {"Interviews": 0.0, "External": 0.0, "Internal": 0.0}
+    for a, b in zip(points, points[1:]):
+        live = [k for s_, e_, k in picked if s_ <= a and e_ >= b]
+        if live:
+            k = min(live, key=lambda x: order[x])
+            by[k] += (b - a).total_seconds() / 3600
+    by = {k: round(v, 1) for k, v in by.items()}
+    return {"hours": round(sum(by.values()), 1), "by": by}
