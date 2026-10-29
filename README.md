@@ -17,7 +17,8 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | **Dashboard** | Streamlit | Interactive web UI for viewing metrics and managing users |
 | **Authentication** | Google Service Account | Domain-Wide Delegation to access Gmail across domains |
 | **Automation** | GitHub Actions | Runs daily sync at 1:00 AM EST |
-| **Hosting** | Streamlit Community Cloud | Hosts the dashboard (public app behind email sign-in) |
+| **Hosting** | Railway | Hosts the dashboard (public app behind email sign-in) |
+| **Old link** | Streamlit Community Cloud | Runs `redirect.py`, which forwards lumiere-email-tracker.streamlit.app to Railway |
 
 ---
 
@@ -43,6 +44,8 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit dashboard - the main UI |
+| `Procfile` | How Railway starts the dashboard |
+| `redirect.py` | Redirect page run on Streamlit Cloud so the old link keeps working |
 | `auth.py` | Email one-time-code sign-in for the dashboard |
 | `tracker_supabase.py` | Core tracking logic - fetches Gmail, processes threads, saves to Supabase |
 | `requirements.txt` | Python dependencies |
@@ -113,7 +116,7 @@ Each domain needs to authorize the service account in their Google Admin Console
 - `SUPABASE_KEY`
 - `GOOGLE_CREDENTIALS_JSON` (full JSON content of credentials.json)
 
-### 4. Streamlit Cloud Secrets
+### 4. Railway Variables (dashboard)
 - `SUPABASE_URL`
 - `SUPABASE_KEY`
 - `GITHUB_TOKEN` (for triggering workflows from dashboard)
@@ -121,17 +124,22 @@ Each domain needs to authorize the service account in their Google Admin Console
 - `RESEND_API_KEY` (Resend API key, same Resend account as the mentor and student portals)
 - `FROM_EMAIL` (sender for sign-in codes, e.g. `Lumiere Email Dashboard <dashboard@lumiere.education>`; the domain must be verified in Resend)
 
+### 5. Streamlit Cloud Secrets (redirect only)
+- `DASHBOARD_URL` (the Railway address the old link forwards to)
+
+The Streamlit Cloud app must run `redirect.py`, never `app.py`: public Streamlit Cloud apps hand search engines a saved copy of the page, which bypasses the email sign-in.
+
 ---
 
 ## Auth
 
-The app is public on Streamlit Community Cloud, so team members don't need a Streamlit account. Access is controlled by email sign-in instead: `auth.py` shows a sign-in screen before anything else renders. Visitors enter a work email on one of the internal domains (`DEFAULT_INTERNAL_DOMAINS` in `tracker_supabase.py`, exact match, no subdomains) and receive a 6-digit code, sent through Resend from `FROM_EMAIL`. The sender address doesn't need a mailbox; `lumiere.education` just has to be verified in Resend.
+The dashboard is public on Railway, so team members don't need any other account. Access is controlled by email sign-in instead: `auth.py` shows a sign-in screen before anything else renders. Visitors enter a work email on one of the internal domains (`DEFAULT_INTERNAL_DOMAINS` in `tracker_supabase.py`, exact match, no subdomains) and receive a 6-digit code, sent through Resend from `FROM_EMAIL`. The sender address doesn't need a mailbox; `lumiere.education` just has to be verified in Resend.
 
 Codes expire after 10 minutes, work once, and lock after 5 wrong tries. Each email can request a new code every 60 seconds, up to 5 per hour. Codes are stored hashed in the `otp_codes` table, so reloading the page doesn't reset the limits.
 
 A sign-in lasts for the browser session: refreshing the page or opening a new tab means signing in again. Use "Log out" in the sidebar to end it early.
 
-Because the app is public, `hide_from_search_engines()` in `auth.py` adds a `noindex` robots tag to every page so Google drops it from search results. Streamlit Cloud can't serve `robots.txt` or set headers, so the tag is added with JavaScript, which Google honours when it renders the page. Even if the app shows up somewhere, visitors who aren't signed in only see the title and the email box.
+Because the app is public, `hide_from_search_engines()` in `auth.py` adds a `noindex` robots tag to every page so Google drops it from search results. Streamlit can't serve `robots.txt` or set headers, so the tag is added with JavaScript, which Google honours when it renders the page. Even if the app shows up somewhere, visitors who aren't signed in only see the title and the email box.
 
 ---
 
@@ -211,7 +219,7 @@ git commit -m "Description of changes"
 git push origin main
 ```
 
-The Streamlit Cloud app will auto-redeploy. If you changed `tracker_supabase.py`, the next GitHub Actions run (or manual trigger) will use the new code.
+Railway will auto-redeploy the dashboard. If you changed `tracker_supabase.py`, the next GitHub Actions run (or manual trigger) will use the new code.
 
 ---
 
@@ -248,16 +256,18 @@ python3 tracker_supabase.py --user email@domain.com --backfill
 ## Monitoring & Troubleshooting
 
 - **GitHub Actions logs**: Check workflow runs at `github.com/stephent-lumiere/lumiere-email-tracker/actions`
-- **Streamlit logs**: Click "Manage app" in the deployed app to view logs
+- **Dashboard logs**: Open the service in Railway and check its Deployments and logs
+- **Redirect logs**: Click "Manage app" on lumiere-email-tracker.streamlit.app
 - **Supabase**: View data directly in the Supabase dashboard table editor
 
 ---
 
 ## Cost
 
-- **Streamlit Community Cloud**: Free
+- **Railway**: Paid plan, a few dollars a month
+- **Streamlit Community Cloud** (redirect only): Free
 - **Supabase**: Free tier (sufficient for this use case)
 - **GitHub Actions**: Free for public repos
 - **Google API**: Free (within quota limits)
 
-**Total: $0/month**
+**Total: Railway's monthly cost**
