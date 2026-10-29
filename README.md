@@ -4,7 +4,7 @@
 
 The Lumiere Email Response Tracker is an internal tool that monitors and analyzes email response times across the organization. It replaces the previous TimeToReply tool with a custom solution that provides more flexibility and control over tracking metrics.
 
-The system automatically fetches email data from Gmail using Google's API, calculates response times for external emails, and presents the data through an interactive dashboard. It supports multiple domains (lumiere.education, ladderinternships.com, veritasai.com, horizoninspires.com, youngfounderslab.org, wallstreetguide.net) and treats emails between these domains as "internal" (not tracked for response time).
+The system automatically fetches email data from Gmail using Google's API, calculates response times for external emails, and presents the data through an interactive dashboard. It supports multiple domains (lumiere.education, ladderinternships.com, veritasai.com, horizoninspires.com, youngfounderslab.org, wallstreetguide.net, researchscholarprogram.com) and treats emails between these domains as "internal" (not tracked for response time).
 
 ---
 
@@ -17,7 +17,7 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | **Dashboard** | Streamlit | Interactive web UI for viewing metrics and managing users |
 | **Authentication** | Google Service Account | Domain-Wide Delegation to access Gmail across domains |
 | **Automation** | GitHub Actions | Runs daily sync at 1:00 AM EST |
-| **Hosting** | Streamlit Community Cloud | Hosts the public dashboard |
+| **Hosting** | Streamlit Community Cloud | Hosts the dashboard (private app, plus email sign-in) |
 
 ---
 
@@ -43,6 +43,7 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit dashboard - the main UI |
+| `auth.py` | Email one-time-code sign-in for the dashboard |
 | `tracker_supabase.py` | Core tracking logic - fetches Gmail, processes threads, saves to Supabase |
 | `requirements.txt` | Python dependencies |
 | `.github/workflows/daily-sync.yml` | GitHub Actions workflow for automated daily sync |
@@ -84,6 +85,15 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 - `max_response_hours` (numeric)
 - Unique constraint on `(user_email, date)`
 
+**otp_codes** (dashboard sign-in codes, see `migrations/create_otp_codes.sql`)
+- `id` (uuid)
+- `email` (text)
+- `code_hash` (text) - HMAC-SHA256 of the code, never the code itself
+- `expires_at` (timestamp)
+- `attempts` (integer)
+- `created_at` (timestamp)
+- `consumed_at` (timestamp)
+
 ---
 
 ## Setup Requirements
@@ -107,6 +117,22 @@ Each domain needs to authorize the service account in their Google Admin Console
 - `SUPABASE_URL`
 - `SUPABASE_KEY`
 - `GITHUB_TOKEN` (for triggering workflows from dashboard)
+- `OTP_SECRET` (long random string for hashing sign-in codes)
+- `RESEND_API_KEY` (Resend API key, same Resend account as the mentor and student portals)
+- `FROM_EMAIL` (sender for sign-in codes, e.g. `Lumiere Email Dashboard <dashboard@lumiere.education>`; the domain must be verified in Resend)
+
+---
+
+## Auth
+
+The dashboard has two layers of access control:
+
+1. **Streamlit sharing**: the app is private on Streamlit Community Cloud (Settings → Sharing → "Only specific people can view this app"). Keep it private: public Streamlit apps get indexed by Google.
+2. **Email sign-in**: `auth.py` shows a sign-in screen before anything else renders. Visitors enter a work email on one of the internal domains (`DEFAULT_INTERNAL_DOMAINS` in `tracker_supabase.py`, exact match, no subdomains) and receive a 6-digit code, sent through Resend from `FROM_EMAIL`. The sender address doesn't need a mailbox; `lumiere.education` just has to be verified in Resend.
+
+Codes expire after 10 minutes, work once, and lock after 5 wrong tries. Each email can request a new code every 60 seconds, up to 5 per hour. Codes are stored hashed in the `otp_codes` table, so reloading the page doesn't reset the limits.
+
+A sign-in lasts for the browser session: refreshing the page or opening a new tab means signing in again. Use "Log out" in the sidebar to end it early.
 
 ---
 

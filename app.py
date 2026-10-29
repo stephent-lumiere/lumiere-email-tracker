@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
 
+from auth import require_login, render_account_sidebar
+
 
 # How long cached Supabase reads stay fresh (in seconds). The data only
 # refreshes once a day from the GitHub Actions sync, so 5 minutes of staleness
@@ -1002,12 +1004,17 @@ st.set_page_config(
     layout="wide"
 )
 
+# Sign-in gate: nothing below renders until the visitor has verified an email code
+require_login(get_supabase())
+
 # Initialize session state for data refresh
 if 'refresh_counter' not in st.session_state:
     st.session_state.refresh_counter = 0
 
 # Sidebar
 with st.sidebar:
+    render_account_sidebar()
+
     st.header("Settings")
 
     # Time Window Dropdown
