@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import resend
 import streamlit as st
+import streamlit.components.v1 as components
 
 from tracker_supabase import DEFAULT_INTERNAL_DOMAINS
 
@@ -180,6 +181,37 @@ def verify_code(supabase, email: str, code: str) -> tuple[bool, str]:
         return False, "That code has already been used. Request a new one."
 
     return True, "Signed in."
+
+
+def hide_from_search_engines() -> None:
+    """Add a robots noindex meta tag to the page head.
+
+    Streamlit Cloud can't serve robots.txt or set headers, so this injects the
+    tag with JavaScript, which Google honours when it renders the page. The
+    component runs in an iframe; the tag goes on the app page and, when
+    reachable, on Streamlit Cloud's outer page too.
+    """
+    components.html(
+        """
+        <script>
+        (function () {
+            var docs = [];
+            try { docs.push(window.parent.document); } catch (e) {}
+            try {
+                if (window.top !== window.parent) docs.push(window.top.document);
+            } catch (e) {}
+            docs.forEach(function (doc) {
+                if (doc.querySelector('meta[name="robots"]')) return;
+                var meta = doc.createElement("meta");
+                meta.name = "robots";
+                meta.content = "noindex, nofollow";
+                doc.head.appendChild(meta);
+            });
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 def require_login(supabase) -> str:

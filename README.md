@@ -17,7 +17,7 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | **Dashboard** | Streamlit | Interactive web UI for viewing metrics and managing users |
 | **Authentication** | Google Service Account | Domain-Wide Delegation to access Gmail across domains |
 | **Automation** | GitHub Actions | Runs daily sync at 1:00 AM EST |
-| **Hosting** | Streamlit Community Cloud | Hosts the dashboard (private app, plus email sign-in) |
+| **Hosting** | Streamlit Community Cloud | Hosts the dashboard (public app behind email sign-in) |
 
 ---
 
@@ -125,14 +125,13 @@ Each domain needs to authorize the service account in their Google Admin Console
 
 ## Auth
 
-The dashboard has two layers of access control:
-
-1. **Streamlit sharing**: the app is private on Streamlit Community Cloud (Settings → Sharing → "Only specific people can view this app"). Keep it private: public Streamlit apps get indexed by Google.
-2. **Email sign-in**: `auth.py` shows a sign-in screen before anything else renders. Visitors enter a work email on one of the internal domains (`DEFAULT_INTERNAL_DOMAINS` in `tracker_supabase.py`, exact match, no subdomains) and receive a 6-digit code, sent through Resend from `FROM_EMAIL`. The sender address doesn't need a mailbox; `lumiere.education` just has to be verified in Resend.
+The app is public on Streamlit Community Cloud, so team members don't need a Streamlit account. Access is controlled by email sign-in instead: `auth.py` shows a sign-in screen before anything else renders. Visitors enter a work email on one of the internal domains (`DEFAULT_INTERNAL_DOMAINS` in `tracker_supabase.py`, exact match, no subdomains) and receive a 6-digit code, sent through Resend from `FROM_EMAIL`. The sender address doesn't need a mailbox; `lumiere.education` just has to be verified in Resend.
 
 Codes expire after 10 minutes, work once, and lock after 5 wrong tries. Each email can request a new code every 60 seconds, up to 5 per hour. Codes are stored hashed in the `otp_codes` table, so reloading the page doesn't reset the limits.
 
 A sign-in lasts for the browser session: refreshing the page or opening a new tab means signing in again. Use "Log out" in the sidebar to end it early.
+
+Because the app is public, `hide_from_search_engines()` in `auth.py` adds a `noindex` robots tag to every page so Google drops it from search results. Streamlit Cloud can't serve `robots.txt` or set headers, so the tag is added with JavaScript, which Google honours when it renders the page. Even if the app shows up somewhere, visitors who aren't signed in only see the title and the email box.
 
 ---
 

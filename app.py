@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from supabase import create_client
 
-from auth import require_login, render_account_sidebar
+from auth import hide_from_search_engines, require_login, render_account_sidebar
 
 
 # How long cached Supabase reads stay fresh (in seconds). The data only
@@ -1003,6 +1003,9 @@ st.set_page_config(
     page_icon="📧",
     layout="wide"
 )
+
+# Keep the public app out of search results
+hide_from_search_engines()
 
 # Sign-in gate: nothing below renders until the visitor has verified an email code
 require_login(get_supabase())
