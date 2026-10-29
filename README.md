@@ -18,7 +18,6 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 | **Authentication** | Google Service Account | Domain-Wide Delegation to access Gmail across domains |
 | **Automation** | GitHub Actions | Runs daily sync at 1:00 AM EST |
 | **Hosting** | Railway | Hosts the dashboard (public app behind email sign-in) |
-| **Old link** | Streamlit Community Cloud | Runs `redirect.py`, which forwards lumiere-email-tracker.streamlit.app to Railway |
 
 ---
 
@@ -45,7 +44,6 @@ The system automatically fetches email data from Gmail using Google's API, calcu
 |------|---------|
 | `app.py` | Streamlit dashboard - the main UI |
 | `Procfile` | How Railway starts the dashboard |
-| `redirect.py` | Redirect page run on Streamlit Cloud so the old link keeps working |
 | `auth.py` | Email one-time-code sign-in for the dashboard |
 | `tracker_supabase.py` | Core tracking logic - fetches Gmail, processes threads, saves to Supabase |
 | `requirements.txt` | Python dependencies |
@@ -124,10 +122,7 @@ Each domain needs to authorize the service account in their Google Admin Console
 - `RESEND_API_KEY` (Resend API key, same Resend account as the mentor and student portals)
 - `FROM_EMAIL` (sender for sign-in codes, e.g. `Lumiere Email Dashboard <dashboard@lumiere.education>`; the domain must be verified in Resend)
 
-### 5. Streamlit Cloud Secrets (redirect only)
-- `DASHBOARD_URL` (the Railway address the old link forwards to)
-
-The Streamlit Cloud app must run `redirect.py`, never `app.py`: public Streamlit Cloud apps hand search engines a saved copy of the page, which bypasses the email sign-in.
+Don't host the dashboard as a public app on Streamlit Community Cloud: public apps there hand search engines a saved copy of the page, which bypasses the email sign-in.
 
 ---
 
@@ -257,7 +252,6 @@ python3 tracker_supabase.py --user email@domain.com --backfill
 
 - **GitHub Actions logs**: Check workflow runs at `github.com/stephent-lumiere/lumiere-email-tracker/actions`
 - **Dashboard logs**: Open the service in Railway and check its Deployments and logs
-- **Redirect logs**: Click "Manage app" on lumiere-email-tracker.streamlit.app
 - **Supabase**: View data directly in the Supabase dashboard table editor
 
 ---
@@ -265,7 +259,6 @@ python3 tracker_supabase.py --user email@domain.com --backfill
 ## Cost
 
 - **Railway**: Paid plan, a few dollars a month
-- **Streamlit Community Cloud** (redirect only): Free
 - **Supabase**: Free tier (sufficient for this use case)
 - **GitHub Actions**: Free for public repos
 - **Google API**: Free (within quota limits)
